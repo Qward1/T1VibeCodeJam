@@ -1,0 +1,58 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f6f8fb;
+  --fg: #0b1225;
+  --card: #ffffff;
+  --muted: #5f6b88;
+  --border: rgba(9, 48, 95, 0.12);
+  color-scheme: light;
+}
+
+:root.dark {
+  --bg: #030712;
+  --fg: #e6eeff;
+  --card: #0b152b;
+  --muted: #94a3b8;
+  --border: rgba(148, 163, 184, 0.25);
+  color-scheme: dark;
+}
+
+* {
+  @apply antialiased;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.bg-mesh {
+  background-image: theme('backgroundImage.mesh');
+}
+
+.glass {
+  background: linear-gradient(135deg, rgba(255,255,255,0.12), rgba(255,255,255,0.04));
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+}
+
+.card-grid {
+  @apply grid gap-6 sm:grid-cols-2 xl:grid-cols-3;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(47, 125, 255, 0.6);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

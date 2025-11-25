@@ -1,0 +1,16 @@
+{
+  "users": [
+    {
+      "id": "super-1",
+      "email": "root@vibe.dev",
+      "name": "Главный админ",
+      "passwordHash": "d033e22ae348aeb5660fc2140aec35850c4da997",
+      "level": "Senior",
+      "role": "superadmin",
+      "admin": true
+    }
+  ],
+  "sessions": [],
+  "reports": [],
+  "chats": {}
+}

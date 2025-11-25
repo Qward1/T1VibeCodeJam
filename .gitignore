@@ -1,0 +1,34 @@
+# Node/Next build
+.next
+out
+node_modules
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+
+# Python venv/bytecode
+.venv
+__pycache__
+*.pyc
+
+# SQLite data
+data/api.sqlite
+
+# Misc
+*.swp
+*.swo
