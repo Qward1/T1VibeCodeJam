@@ -9,6 +9,7 @@ import { formatDate } from "@/utils";
 import { useAuthStore } from "@/stores/auth";
 import { Button } from "@/components/UI/Button";
 import { useEffect } from "react";
+import { Select } from "@/components/UI/Select";
 
 export default function AdminPage() {
   const user = useAuthStore((s) => s.user);
@@ -64,6 +65,28 @@ export default function AdminPage() {
   });
   const [search, setSearch] = useState("");
   const isSuper = user?.role === "superadmin";
+  const [tab, setTab] = useState<"overview" | "sessions" | "config">("overview");
+  const [sessionFilters, setSessionFilters] = useState<{ level?: string; status?: string }>({});
+  const { data: sessions } = useQuery({
+    queryKey: ["admin-sessions", sessionFilters],
+    queryFn: () => api.getAdminSessions(sessionFilters),
+    enabled: isAdmin,
+  });
+  const [selectedSession, setSelectedSession] = useState<any | null>(null);
+  const sessionDetailQuery = useQuery({
+    queryKey: ["admin-session-detail", selectedSession?.id],
+    queryFn: () => (selectedSession ? api.getAdminSessionDetail(selectedSession.id) : null),
+    enabled: isAdmin && !!selectedSession?.id,
+  });
+  const { data: adminConfig } = useQuery({
+    queryKey: ["admin-config"],
+    queryFn: api.getAdminConfig,
+    enabled: isAdmin,
+  });
+  const saveConfigMutation = useMutation({
+    mutationFn: (cfg: any) => api.saveAdminConfig(cfg),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin-config"] }),
+  });
 
   const grantMutation = useMutation({
     mutationFn: (targetUserId: string) => api.grantAdmin(targetUserId),
@@ -99,7 +122,20 @@ export default function AdminPage() {
           <h1 className="text-3xl font-semibold">Кандидаты и анти-чит</h1>
         </div>
       </div>
+      <div className="flex gap-2">
+        <Button variant={tab === "overview" ? "primary" : "outline"} onClick={() => setTab("overview")}>
+          Обзор
+        </Button>
+        <Button variant={tab === "sessions" ? "primary" : "outline"} onClick={() => setTab("sessions")}>
+          Сессии
+        </Button>
+        <Button variant={tab === "config" ? "primary" : "outline"} onClick={() => setTab("config")}>
+          Настройки
+        </Button>
+      </div>
 
+      {tab === "overview" && (
+        <>
       <Card title="Список кандидатов">
         <div className="mb-3">
           <Input placeholder="Поиск по имени или email" value={search} onChange={(e) => setSearch(e.target.value)} />
@@ -324,6 +360,161 @@ export default function AdminPage() {
           </div>
         </Card>
       </div>
+      </>
+      )}
+
+      {tab === "sessions" && (
+        <div className="grid gap-4 lg:grid-cols-3">
+          <Card title="Сессии">
+            <div className="mb-2 flex gap-2">
+              <select
+                className="rounded-full border border-[var(--border)] px-3 py-2 text-sm"
+                value={sessionFilters.level || ""}
+                onChange={(e) => setSessionFilters((f) => ({ ...f, level: e.target.value || undefined }))}
+              >
+                <option value="">Все уровни</option>
+                <option value="junior">Junior</option>
+                <option value="middle">Middle</option>
+                <option value="senior">Senior</option>
+              </select>
+              <select
+                className="rounded-full border border-[var(--border)] px-3 py-2 text-sm"
+                value={sessionFilters.status || ""}
+                onChange={(e) => setSessionFilters((f) => ({ ...f, status: e.target.value || undefined }))}
+              >
+                <option value="">Все статусы</option>
+                <option value="active">Active</option>
+                <option value="finished">Finished</option>
+              </select>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="text-left text-[var(--muted)]">
+                  <tr>
+                    <th>Кандидат</th>
+                    <th>Дата</th>
+                    <th>Направление</th>
+                    <th>Уровень</th>
+                    <th>Чит</th>
+                    <th>Статус</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--border)]">
+                  {(sessions ?? []).map((s) => (
+                    <tr
+                      key={s.id}
+                      className="cursor-pointer hover:bg-vibe-50/60 dark:hover:bg-white/5"
+                      onClick={() => setSelectedSession(s)}
+                    >
+                      <td className="py-2 font-semibold">{s.candidate}</td>
+                      <td className="text-[var(--muted)]">{formatDate(s.createdAt)}</td>
+                      <td>{s.direction}</td>
+                      <td>{s.level}</td>
+                      <td>
+                        <Badge label={`${s.cheat_score ?? 0}`} tone={(s.cheat_score ?? 0) > 5 ? "warning" : "info"} />
+                      </td>
+                      <td>{s.status}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {(sessions ?? []).length === 0 && <div className="mt-2 text-sm text-[var(--muted)]">Сессий нет</div>}
+            </div>
+          </Card>
+          <Card title="Детали сессии" className="lg:col-span-2">
+            {sessionDetailQuery.data ? (
+              <div className="space-y-2 text-sm">
+                <div className="font-semibold">Сессия: {sessionDetailQuery.data.session.id}</div>
+                <div>Направление: {sessionDetailQuery.data.session.direction}</div>
+                <div>Уровень: {sessionDetailQuery.data.session.current_level || sessionDetailQuery.data.session.level}</div>
+                <div>Статус: {sessionDetailQuery.data.session.status}</div>
+                <div>Чит-скор: {sessionDetailQuery.data.session.cheat_score ?? 0}</div>
+                <div className="mt-2 font-semibold">Вопросы</div>
+                <ul className="space-y-1">
+                  {sessionDetailQuery.data.questions.map((q: any) => (
+                    <li key={q.id} className="rounded-lg border border-[var(--border)] px-2 py-1">
+                      {q.title} ({q.status})</li>
+                  ))}
+                </ul>
+                <div className="mt-2 font-semibold">Метрики</div>
+                <pre className="rounded-lg bg-[var(--card)] p-2 text-xs whitespace-pre-wrap">
+                  {JSON.stringify(sessionDetailQuery.data.metrics || {}, null, 2)}
+                </pre>
+                <div className="mt-2 font-semibold">Чат</div>
+                <div className="max-h-48 overflow-y-auto space-y-1 text-xs">
+                  {sessionDetailQuery.data.messages.map((m: any) => (
+                    <div key={m.id} className={`flex ${m.role === "assistant" ? "justify-start" : "justify-end"}`}>
+                      <div className="rounded-xl bg-[var(--card)] px-2 py-1">{m.content}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-[var(--muted)]">Выберите сессию</div>
+            )}
+          </Card>
+        </div>
+      )}
+
+      {tab === "config" && (
+        <Card title="Настройки">
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="text-sm">
+              Модель задач
+              <Input
+                value={(adminConfig?.task_model as string) || "qwen3-coder-30b-a3b-instruct-fp8"}
+                onChange={(e) => saveConfigMutation.mutate({ ...(adminConfig || {}), task_model: e.target.value })}
+              />
+            </label>
+            <label className="text-sm">
+              Модель объяснений
+              <Input
+                value={(adminConfig?.chat_model as string) || "qwen3-32b-awq"}
+                onChange={(e) => saveConfigMutation.mutate({ ...(adminConfig || {}), chat_model: e.target.value })}
+              />
+            </label>
+            <label className="text-sm">
+              Temperature
+              <Input
+                value={(adminConfig?.temperature as string) || "0.4"}
+                onChange={(e) => saveConfigMutation.mutate({ ...(adminConfig || {}), temperature: e.target.value })}
+              />
+            </label>
+            <label className="text-sm">
+              Top_p
+              <Input
+                value={(adminConfig?.top_p as string) || "0.9"}
+                onChange={(e) => saveConfigMutation.mutate({ ...(adminConfig || {}), top_p: e.target.value })}
+              />
+            </label>
+            <label className="text-sm">
+              Max tokens
+              <Input
+                value={(adminConfig?.max_tokens as string) || "900"}
+                onChange={(e) => saveConfigMutation.mutate({ ...(adminConfig || {}), max_tokens: e.target.value })}
+              />
+            </label>
+            <label className="text-sm md:col-span-2">
+              Prompt генерации задач (system)
+              <textarea
+                className="mt-1 w-full rounded-xl border border-[var(--border)] bg-[var(--card)] p-2"
+                rows={3}
+                value={(adminConfig?.prompt_task as string) || ""}
+                onChange={(e) => saveConfigMutation.mutate({ ...(adminConfig || {}), prompt_task: e.target.value })}
+              />
+            </label>
+            <label className="text-sm md:col-span-2">
+              Prompt оценки кода (system)
+              <textarea
+                className="mt-1 w-full rounded-xl border border-[var(--border)] bg-[var(--card)] p-2"
+                rows={3}
+                value={(adminConfig?.prompt_review as string) || ""}
+                onChange={(e) => saveConfigMutation.mutate({ ...(adminConfig || {}), prompt_review: e.target.value })}
+              />
+            </label>
+          </div>
+        </Card>
+      )}
     </main>
   );
 }

@@ -276,14 +276,13 @@ export const api = {
     if (useBackend && API_BASE) {
       if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
       try {
-        await call<{ status: string }>("/api/anticheat/event", {
+        await call<{ status: string }>("/api/interview/event", {
           method: "POST",
           body: JSON.stringify({
-            sessionId: event.sessionId,
+            session_id: event.sessionId,
             ownerId: activeUser.id,
-            eventType: event.eventType,
-            payload: JSON.stringify(event.payload ?? {}),
-            risk: event.risk ?? "medium",
+            event_type: event.eventType,
+            payload: event.payload ?? {},
           }),
         });
         return true;
@@ -678,6 +677,52 @@ export const api = {
     return withDelay([]);
   },
 
+  async getAdminSessions(filters?: { level?: string; status?: string; date_from?: string; date_to?: string }) {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      const params = new URLSearchParams({ adminId: activeUser.id });
+      if (filters?.level) params.append("level", filters.level);
+      if (filters?.status) params.append("status", filters.status);
+      if (filters?.date_from) params.append("date_from", filters.date_from);
+      if (filters?.date_to) params.append("date_to", filters.date_to);
+      const { sessions } = await call<{ sessions: any[] }>(`/api/admin/sessions?${params.toString()}`);
+      return sessions;
+    }
+    return withDelay([]);
+  },
+
+  async getAdminSessionDetail(id: string) {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      const data = await call<{ session: any; questions: any[]; answers: any[]; events: any[]; metrics: any; messages: any[] }>(
+        `/api/admin/session/${id}?adminId=${activeUser.id}`
+      );
+      return data;
+    }
+    return withDelay(null);
+  },
+
+  async getAdminConfig() {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      const { config } = await call<{ config: any }>(`/api/admin/config?adminId=${activeUser.id}`);
+      return config;
+    }
+    return withDelay({});
+  },
+
+  async saveAdminConfig(cfg: any) {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      await call<{ status: string }>(`/api/admin/config`, {
+        method: "POST",
+        body: JSON.stringify({ adminId: activeUser.id, config: cfg }),
+      });
+      return true;
+    }
+    return withDelay(true);
+  },
+
   async clearAdminEvents() {
     if (useBackend && API_BASE) {
       if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
@@ -724,5 +769,85 @@ export const api = {
     };
     localSessions[sessionId] = updated;
     return withDelay(updated);
+  },
+
+  async streamChatSSE(params: {
+    sessionId: string;
+    questionId?: string;
+    message: string;
+    onDelta: (delta: string) => void;
+    onError?: (err: any) => void;
+    onEnd?: () => void;
+  }) {
+    if (!API_BASE) throw new Error("API_BASE_NOT_SET");
+    try {
+      const res = await fetch(`${API_BASE}/api/interview/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: params.sessionId, questionId: params.questionId, message: params.message }),
+      });
+      if (!res.body) throw new Error("NO_STREAM");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+        for (const part of parts) {
+          const line = part.replace(/^data:\s*/, "");
+          if (!line) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj.delta) params.onDelta(obj.delta);
+          } catch {}
+        }
+      }
+      params.onEnd?.();
+    } catch (e) {
+      params.onError?.(e);
+    }
+  },
+
+  async streamNextSSE(params: {
+    sessionId: string;
+    ownerId: string;
+    language?: string;
+    onDelta: (delta: string) => void;
+    onError?: (err: any) => void;
+    onEnd?: () => void;
+  }) {
+    if (!API_BASE) throw new Error("API_BASE_NOT_SET");
+    try {
+      const res = await fetch(`${API_BASE}/api/interview/next/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: params.sessionId, ownerId: params.ownerId, language: params.language }),
+      });
+      if (!res.body) throw new Error("NO_STREAM");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+        for (const part of parts) {
+          const line = part.replace(/^data:\s*/, "");
+          if (!line) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj.delta) params.onDelta(obj.delta);
+          } catch {}
+        }
+      }
+      params.onEnd?.();
+    } catch (e) {
+      params.onError?.(e);
+    }
   },
 };

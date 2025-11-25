@@ -12,7 +12,15 @@ def sha1(val: str) -> str:
 
 def connect():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10.0, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+    except Exception:
+        pass
+    return conn
 
 
 def seed_questions(cur, force: bool = False):
@@ -80,12 +88,15 @@ def ensure_schema():
         """
         CREATE TABLE IF NOT EXISTS interview_events (
           id TEXT PRIMARY KEY,
-          sessionId TEXT NOT NULL,
+          sessionId TEXT,
+          session_id TEXT,
           ownerId TEXT,
           event_type TEXT NOT NULL,
           payload TEXT,
+          payload_json TEXT,
           risk_level TEXT DEFAULT 'low',
-          createdAt TEXT DEFAULT CURRENT_TIMESTAMP
+          createdAt TEXT DEFAULT CURRENT_TIMESTAMP,
+          ts TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -99,6 +110,14 @@ def ensure_schema():
           useIDE INTEGER DEFAULT 1,
           direction TEXT,
           level TEXT,
+          candidate_id TEXT,
+          current_level TEXT,
+          current_question_index INTEGER DEFAULT 0,
+          status TEXT DEFAULT 'active',
+          started_at TEXT,
+          finished_at TEXT,
+          cheat_score REAL,
+          metadata_json TEXT,
           format TEXT,
           tasks TEXT,
           description TEXT,
@@ -146,7 +165,8 @@ def ensure_schema():
           sessionId TEXT NOT NULL,
           ownerId TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'completed',
-          finishedAt TEXT DEFAULT CURRENT_TIMESTAMP
+          finishedAt TEXT DEFAULT CURRENT_TIMESTAMP,
+          metrics_json TEXT
         )
         """
     )
@@ -158,6 +178,13 @@ def ensure_schema():
           questionId TEXT NOT NULL,
           ownerId TEXT NOT NULL,
           content TEXT NOT NULL,
+          code TEXT,
+          language TEXT,
+          passed_visible INTEGER,
+          passed_hidden INTEGER,
+          attempt_number INTEGER,
+          duration_ms INTEGER,
+          metrics_json TEXT,
           updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
           UNIQUE(sessionId, questionId)
         )
@@ -168,32 +195,38 @@ def ensure_schema():
         CREATE TABLE IF NOT EXISTS session_questions (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           sessionId TEXT NOT NULL,
+          session_id TEXT,
           questionId TEXT NOT NULL,
           questionTitle TEXT,
-          position INTEGER
+          position INTEGER,
+          order_index INTEGER,
+          status TEXT DEFAULT 'current',
+          llm_raw_response TEXT
         )
         """
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS questions (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          body TEXT NOT NULL,
-          answer TEXT NOT NULL,
-          hint TEXT,
-          difficulty TEXT NOT NULL,
-          tags TEXT,
-          useIDE INTEGER DEFAULT 0,
-          createdAt TEXT DEFAULT CURRENT_TIMESTAMP,
-          updatedAt TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
+    sq_cols = [c[1] for c in cur.execute("PRAGMA table_info(session_questions)").fetchall()]
+    for col, ddl in [
+        ("session_id", "ALTER TABLE session_questions ADD COLUMN session_id TEXT"),
+        ("order_index", "ALTER TABLE session_questions ADD COLUMN order_index INTEGER"),
+        ("status", "ALTER TABLE session_questions ADD COLUMN status TEXT DEFAULT 'current'"),
+        ("llm_raw_response", "ALTER TABLE session_questions ADD COLUMN llm_raw_response TEXT"),
+    ]:
+        if col not in sq_cols:
+            cur.execute(ddl)
     # Добавляем колонку lang, если её нет
     cols = [c[1] for c in cur.execute("PRAGMA table_info(users)").fetchall()]
     if "lang" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'ru'")
+    # interview_events дополнительные поля
+    ie_cols = [c[1] for c in cur.execute("PRAGMA table_info(interview_events)").fetchall()]
+    if "session_id" not in ie_cols:
+        cur.execute("ALTER TABLE interview_events ADD COLUMN session_id TEXT")
+    if "payload_json" not in ie_cols:
+        cur.execute("ALTER TABLE interview_events ADD COLUMN payload_json TEXT")
+    if "ts" not in ie_cols:
+        cur.execute("ALTER TABLE interview_events ADD COLUMN ts TEXT")
+        cur.execute("UPDATE interview_events SET ts = COALESCE(createdAt, datetime('now')) WHERE ts IS NULL")
     session_cols = [c[1] for c in cur.execute("PRAGMA table_info(sessions)").fetchall()]
     if "startedAt" not in session_cols:
         cur.execute("ALTER TABLE sessions ADD COLUMN startedAt TEXT")
@@ -207,6 +240,26 @@ def ensure_schema():
         cur.execute("ALTER TABLE sessions ADD COLUMN is_active INTEGER DEFAULT 1")
     if "is_finished" not in session_cols:
         cur.execute("ALTER TABLE sessions ADD COLUMN is_finished INTEGER DEFAULT 0")
+    if "candidate_id" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN candidate_id TEXT")
+    if "current_level" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN current_level TEXT")
+    if "current_question_index" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN current_question_index INTEGER DEFAULT 0")
+    if "started_at" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN started_at TEXT")
+    if "finished_at" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN finished_at TEXT")
+    if "cheat_score" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN cheat_score REAL")
+    if "metadata_json" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN metadata_json TEXT")
+    if "direction" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN direction TEXT")
+    if "level" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN level TEXT")
+    if "progress_percent" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN progress_percent INTEGER DEFAULT 0")
     message_cols = [c[1] for c in cur.execute("PRAGMA table_info(messages)").fetchall()]
     if "questionId" not in message_cols:
         cur.execute("ALTER TABLE messages ADD COLUMN questionId TEXT")
@@ -226,6 +279,8 @@ def ensure_schema():
     ir_cols = [c[1] for c in cur.execute("PRAGMA table_info(interview_results)").fetchall()]
     if "finishedAt" not in ir_cols:
         cur.execute("ALTER TABLE interview_results ADD COLUMN finishedAt TEXT DEFAULT CURRENT_TIMESTAMP")
+    if "metrics_json" not in ir_cols:
+        cur.execute("ALTER TABLE interview_results ADD COLUMN metrics_json TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS answers (
@@ -234,11 +289,30 @@ def ensure_schema():
           questionId TEXT NOT NULL,
           ownerId TEXT NOT NULL,
           content TEXT NOT NULL,
+          code TEXT,
+          language TEXT,
+          passed_visible INTEGER,
+          passed_hidden INTEGER,
+          attempt_number INTEGER,
+          duration_ms INTEGER,
+          metrics_json TEXT,
           updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
           UNIQUE(sessionId, questionId)
         )
         """
     )
+    ans_cols = [c[1] for c in cur.execute("PRAGMA table_info(answers)").fetchall()]
+    for col, ddl in [
+        ("code", "ALTER TABLE answers ADD COLUMN code TEXT"),
+        ("language", "ALTER TABLE answers ADD COLUMN language TEXT"),
+        ("passed_visible", "ALTER TABLE answers ADD COLUMN passed_visible INTEGER"),
+        ("passed_hidden", "ALTER TABLE answers ADD COLUMN passed_hidden INTEGER"),
+        ("attempt_number", "ALTER TABLE answers ADD COLUMN attempt_number INTEGER"),
+        ("duration_ms", "ALTER TABLE answers ADD COLUMN duration_ms INTEGER"),
+        ("metrics_json", "ALTER TABLE answers ADD COLUMN metrics_json TEXT"),
+    ]:
+        if col not in ans_cols:
+            cur.execute(ddl)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS session_questions (
@@ -272,6 +346,14 @@ def ensure_schema():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_config (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+        """
+    )
     question_cols = [c[1] for c in cur.execute("PRAGMA table_info(questions)").fetchall()]
     if "useIDE" not in question_cols or len(question_cols) < 6:
         cur.execute("DROP TABLE IF EXISTS questions")
@@ -281,16 +363,38 @@ def ensure_schema():
               id TEXT PRIMARY KEY,
               title TEXT NOT NULL,
               body TEXT NOT NULL,
+              statement TEXT,
               answer TEXT NOT NULL,
               hint TEXT,
               difficulty TEXT NOT NULL,
+              level TEXT,
+              language TEXT,
               tags TEXT,
+              visible_tests_json TEXT,
+              hidden_tests_json TEXT,
+              canonical_solution TEXT,
+              source TEXT DEFAULT 'manual',
               useIDE INTEGER DEFAULT 0,
               createdAt TEXT DEFAULT CURRENT_TIMESTAMP,
               updatedAt TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+    else:
+        if "statement" not in question_cols:
+            cur.execute("ALTER TABLE questions ADD COLUMN statement TEXT")
+        if "level" not in question_cols:
+            cur.execute("ALTER TABLE questions ADD COLUMN level TEXT")
+        if "language" not in question_cols:
+            cur.execute("ALTER TABLE questions ADD COLUMN language TEXT")
+        if "visible_tests_json" not in question_cols:
+            cur.execute("ALTER TABLE questions ADD COLUMN visible_tests_json TEXT")
+        if "hidden_tests_json" not in question_cols:
+            cur.execute("ALTER TABLE questions ADD COLUMN hidden_tests_json TEXT")
+        if "canonical_solution" not in question_cols:
+            cur.execute("ALTER TABLE questions ADD COLUMN canonical_solution TEXT")
+        if "source" not in question_cols:
+            cur.execute("ALTER TABLE questions ADD COLUMN source TEXT DEFAULT 'manual'")
     # Сидим примеры, если база пустая
     existing = cur.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
     if existing == 0:
