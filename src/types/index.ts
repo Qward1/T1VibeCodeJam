@@ -85,9 +85,14 @@ export type InterviewReport = {
   id: string;
   ownerId?: string;
   sessionId?: string;
+  track?: string;
   score: number;
   level: Level;
   summary: string;
+  summary_candidate?: string;
+  summary_admin?: string;
+  candidate_report_text?: string;
+  candidate_answer_text?: string;
   timeline: { label: string; at: string }[];
   solutions: { title: string; code: string; errors?: string; tests: TestResult }[];
   analytics: {
@@ -95,6 +100,8 @@ export type InterviewReport = {
     errorHeatmap: ErrorHeat[];
     speed: { label: string; value: number }[];
   };
+  metrics?: any;
+  questions?: any;
 };
 
 export type Candidate = {

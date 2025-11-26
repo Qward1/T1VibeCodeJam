@@ -15,6 +15,9 @@ import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/stores/auth";
 
+// Быстрое включение/выключение блокировок контекстного меню и вставки вне редактора
+const BLOCK_CLIPBOARD_GUARDS = false;
+
 export default function InterviewSessionPage({ params }: { params: { id: string } }) {
   const { data: session } = useQuery({
     queryKey: ["session", params.id],
@@ -34,6 +37,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const router = useRouter();
   const queryClient = useQueryClient();
   const user = useAuthStore((s) => s.user);
+  const current = storedSession ?? session ?? null;
   const [attemptsByQuestion, setAttemptsByQuestion] = useState<Record<string, number>>({});
 
   useEffect(() => {
@@ -187,7 +191,6 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const [finishConfirm, setFinishConfirm] = useState(false);
   const [scoreModal, setScoreModal] = useState<{ open: boolean; score: number | null }>({ open: false, score: null });
   const [finishing, setFinishing] = useState(false);
-  const current = storedSession ?? session ?? null;
   const storageKey = useMemo(() => `vibe-code-by-question:${current?.id || "global"}`, [current?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const [codeByQuestion, setCodeByQuestion] = useState<Record<string, string>>(() => {
     if (typeof window === "undefined") return {};
@@ -430,18 +433,23 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("blur", onBlur);
     window.addEventListener("focus", onFocus);
-    document.addEventListener("contextmenu", onContext);
-    document.addEventListener("paste", onPaste, { capture: true });
-    // Запрет выделения вне IDE
-    const prevSelect = document.body.style.userSelect;
-    document.body.style.userSelect = "none";
+    let prevSelect: string | undefined;
+    if (BLOCK_CLIPBOARD_GUARDS) {
+      document.addEventListener("contextmenu", onContext);
+      document.addEventListener("paste", onPaste, { capture: true });
+      // Запрет выделения вне IDE
+      prevSelect = document.body.style.userSelect;
+      document.body.style.userSelect = "none";
+    }
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("blur", onBlur);
       window.removeEventListener("focus", onFocus);
-      document.removeEventListener("contextmenu", onContext);
-      document.removeEventListener("paste", onPaste, { capture: true } as any);
-      document.body.style.userSelect = prevSelect;
+      if (BLOCK_CLIPBOARD_GUARDS) {
+        document.removeEventListener("contextmenu", onContext);
+        document.removeEventListener("paste", onPaste, { capture: true } as any);
+        if (prevSelect !== undefined) document.body.style.userSelect = prevSelect;
+      }
     };
   }, [current?.id]);
 

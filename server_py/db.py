@@ -1,10 +1,49 @@
 import sqlite3
 from pathlib import Path
 import hashlib
+import shutil
+import logging
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "api.sqlite"
+logger = logging.getLogger(__name__)
+
+
+def _healthy_db(path: Path) -> bool:
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA quick_check;")
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1;")
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def _force_disable_wal(path: Path):
+    try:
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA journal_mode=DELETE;")
+        conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to disable WAL", extra={"error": str(exc), "path": str(path)})
+
+
+# Если основной файл бьётся об I/O (часто на DrvFS из-за WAL), пробуем безопасно
+# переключиться на копию, чтобы не падали on-demand генерации отчётов.
+if not _healthy_db(DB_PATH):
+    fallback = DATA_DIR / "api_repair.sqlite"
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(DB_PATH, fallback)
+        if _healthy_db(fallback):
+            logger.warning("Switching DB_PATH to fallback copy due to disk I/O error", extra={"fallback": str(fallback)})
+            DB_PATH = fallback
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to create fallback DB copy", extra={"error": str(exc), "source": str(DB_PATH), "fallback": str(fallback)})
+
+_force_disable_wal(DB_PATH)
 
 def sha1(val: str) -> str:
     return hashlib.sha1(val.encode()).hexdigest()
@@ -413,4 +452,27 @@ def fetchall_dicts(cursor):
     return [dict(zip(columns, r)) for r in rows]
 
 
-ensure_schema()
+def _init_schema_safe():
+    global DB_PATH
+    try:
+        ensure_schema()
+        return
+    except sqlite3.OperationalError as exc:
+        if "disk I/O error" not in str(exc).lower():
+            raise
+        logger.warning("ensure_schema failed with disk I/O, trying fallback copy", extra={"path": str(DB_PATH)})
+        fallback = DATA_DIR / "api_repair.sqlite"
+        try:
+            shutil.copyfile(DB_PATH, fallback)
+            DB_PATH = fallback
+            _force_disable_wal(DB_PATH)
+            ensure_schema()
+            return
+        except Exception as inner:  # noqa: BLE001
+            logger.error("ensure_schema recovery failed", extra={"error": str(inner), "fallback": str(fallback)})
+            raise
+    except Exception:
+        raise
+
+
+_init_schema_safe()

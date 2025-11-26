@@ -419,13 +419,20 @@ def _load_error_hints(cur, session_id: str, question_id: str) -> List[str]:
     return [r.get("content") for r in rows if r.get("content")]
 
 
-def build_normalized_question_report(session_id: str, question_id: str, session_row: dict, cur=None) -> dict:
+def build_normalized_question_report(session_id: str, question_id: str, session_row: Optional[dict] = None, cur=None) -> dict:
+    """
+    Собирает данные по вопросу в нормализованный формат, не зависящий от LLM.
+    """
     local_conn = None
     if cur is None:
         local_conn = sqlite3.connect(DB_PATH)
         cur = local_conn.cursor()
+    if session_row is None:
+        session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,))) or {}
     sq = fetchone_dict(cur.execute("SELECT * FROM session_questions WHERE sessionId=? AND questionId=?", (session_id, question_id)))
     if not sq:
+        if local_conn:
+            local_conn.close()
         return {}
     q_type = sq.get("q_type") or ("coding" if sq.get("code_task_id") else "theory")
     order = sq.get("position") or 0
@@ -442,6 +449,7 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
         "track": session_row.get("direction"),
         "level": session_row.get("level"),
         "title": sq.get("questionTitle") or meta.get("title"),
+        "topic": meta.get("topic") if isinstance(meta, dict) else None,
         "category": sq.get("category"),
         "raw_prompt": meta.get("prompt") if isinstance(meta, dict) else None,
         "raw_llm_question": meta or {},
@@ -453,7 +461,7 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
     }
     llm_eval = None
     code_task = None
-    code_attempts = []
+    code_attempts: List[dict] = []
     hints = _load_hints(cur, session_id, question_id)
     error_hints = _load_error_hints(cur, session_id, question_id)
 
@@ -462,13 +470,31 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
         score = ans.get("score") or 0
         max_score = ans.get("max_score") or meta.get("max_score") or 10
         decision = ans.get("decision")
+        covered_points = ans.get("covered_points") or []
+        missing_points = ans.get("missing_points") or []
+        key_points_input = ans.get("key_points") or []
+        # Собираем единый список key_points со статусами
+        key_points: List[dict] = []
+        def _append_points(points, status):
+            for p in points:
+                if isinstance(p, dict):
+                    txt = p.get("text") or p.get("point") or p.get("title")
+                else:
+                    txt = str(p)
+                if not txt:
+                    continue
+                key_points.append({"text": txt, "status": p.get("status", status) if isinstance(p, dict) else status})
+        _append_points(key_points_input, "covered")
+        _append_points(covered_points, "covered")
+        _append_points(missing_points, "missing")
+
         metrics.update(
             {
                 "score": score,
                 "max_score": max_score,
                 "score_ratio": (score / max_score) if max_score else 0,
                 "verdict": decision,
-                "key_points": [],
+                "key_points": key_points,
                 "llm_feedback_short": ans.get("feedback_short"),
                 "llm_feedback_detailed": ans.get("feedback_detailed"),
             }
@@ -477,12 +503,12 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
             "score": score,
             "max_score": max_score,
             "verdict": decision,
-            "covered_points": ans.get("covered_points"),
-            "missing_points": ans.get("missing_points"),
+            "covered_points": covered_points,
+            "missing_points": missing_points,
+            "raw_eval": ans.get("raw_eval"),
         }
     else:
         task_id = sq.get("code_task_id")
-        code_task = None
         if task_id:
             code_task = fetchone_dict(cur.execute("SELECT * FROM code_tasks WHERE task_id=?", (task_id,)))
         attempts = _load_code_attempts(cur, session_id, question_id, task_id)
@@ -490,10 +516,14 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
         attempts_num = len(attempts)
         score_vals = [a.get("score") or 0 for a in attempts]
         final_score = score_vals[-1] if attempts else 0
-        max_score = max([a.get("score") or 0 for a in attempts] + [code_task.get("max_score", 0) if code_task else 10])
+        # max_score может быть в задаче или в попытках; используем максимум
+        max_score_candidates = [a.get("score") or 0 for a in attempts]
+        if code_task and code_task.get("max_score") is not None:
+            max_score_candidates.append(code_task.get("max_score") or 0)
+        max_score = max(max_score_candidates) if max_score_candidates else 10
         if not max_score:
             max_score = 10
-        hints_used = sq.get("hints_used") or 0
+        hints_used = sq.get("hints_used") or len(hints) or 0
         first_success = None
         for a in attempts:
             if a.get("passed_public") and a.get("passed_hidden"):
@@ -501,6 +531,9 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
                 break
         public_tests_total = len(fetchall_dicts(cur.execute("SELECT id FROM code_tests WHERE task_id=? AND is_public=1", (task_id,)))) if task_id else 0
         hidden_tests_total = len(fetchall_dicts(cur.execute("SELECT id FROM code_tests WHERE task_id=? AND is_public=0", (task_id,)))) if task_id else 0
+        # Попытка, в которой больше всего публичных тестов прошло
+        public_passed = public_tests_total if first_success else 0
+        hidden_passed = hidden_tests_total if first_success else 0
         metrics.update(
             {
                 "attempts": attempts_num,
@@ -508,9 +541,9 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
                 "max_score_code": max_score,
                 "score_ratio_code": (final_score / max_score) if max_score else 0,
                 "public_tests_total": public_tests_total,
-                "public_tests_passed": public_tests_total if first_success else 0,
+                "public_tests_passed": public_passed,
                 "hidden_tests_total": hidden_tests_total,
-                "hidden_tests_passed": hidden_tests_total if first_success else 0,
+                "hidden_tests_passed": hidden_passed,
                 "hints_used": hints_used,
                 "errors_count": attempts_num - (1 if first_success else 0),
                 "first_success_attempt": first_success,
@@ -531,60 +564,179 @@ def build_normalized_question_report(session_id: str, question_id: str, session_
     return out
 
 
-def build_session_metrics(session_id: str) -> dict:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+def build_session_metrics(session_id: str, cur: Optional[sqlite3.Cursor] = None) -> dict:
+    local_conn = None
+    if cur is None:
+        local_conn = sqlite3.connect(DB_PATH)
+        cur = local_conn.cursor()
     session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,)))
     if not session_row:
-        conn.close()
+        if local_conn:
+            local_conn.close()
         return {}
-    sq_rows = fetchall_dicts(cur.execute("SELECT questionId FROM session_questions WHERE sessionId=? ORDER BY position", (session_id,)))
-    questions = [build_normalized_question_report(session_id, r["questionId"], session_row, cur) for r in sq_rows if r.get("questionId")]
-    conn.close()
-    overall_score = 0
-    overall_max = 0
+    sq_rows = fetchall_dicts(
+        cur.execute("SELECT questionId FROM session_questions WHERE sessionId=? ORDER BY position", (session_id,))
+    )
+    questions = [
+        build_normalized_question_report(session_id, r["questionId"], session_row, cur)
+        for r in sq_rows
+        if r.get("questionId")
+    ]
+    # anti-cheat
+    anti_rows = fetchall_dicts(cur.execute("SELECT * FROM interview_events WHERE sessionId=?", (session_id,)))
+    if local_conn:
+        local_conn.close()
+
     total_questions = len(questions)
     theory_q = [q for q in questions if q.get("q_type") == "theory"]
     coding_q = [q for q in questions if q.get("q_type") == "coding"]
+
+    # Общие баллы
+    overall_score = 0
+    overall_max = 0
+    time_total = 0
+    time_by_type = {"theory": [], "coding": []}
     for q in questions:
         m = q.get("metrics") or {}
+        time_total += m.get("time_spent_sec") or 0
+        if q.get("q_type") in ("theory", "coding"):
+            time_by_type[q.get("q_type")].append(m.get("time_spent_sec") or 0)
         if q.get("q_type") == "theory":
             overall_score += m.get("score") or 0
             overall_max += m.get("max_score") or 0
         else:
             overall_score += m.get("score_code") or 0
             overall_max += m.get("max_score_code") or 0
+
+    theory_score = sum((q.get("metrics") or {}).get("score") or 0 for q in theory_q)
+    theory_max = sum((q.get("metrics") or {}).get("max_score") or 0 for q in theory_q)
+    coding_score = sum((q.get("metrics") or {}).get("score_code") or 0 for q in coding_q)
+    coding_max = sum((q.get("metrics") or {}).get("max_score_code") or 0 for q in coding_q)
+    coding_attempts = sum((q.get("metrics") or {}).get("attempts") or 0 for q in coding_q)
+    coding_hints = sum((q.get("metrics") or {}).get("hints_used") or 0 for q in coding_q)
+
+    avg_time_per_q = (time_total / total_questions) if total_questions else 0
+    # если время не посчитано по вопросам, попробуем по старт/финиш сессии
+    if not time_total:
+        start = session_row.get("startedAt")
+        finish = session_row.get("finishedAt")
+        try:
+            if start and finish:
+                def _parse_ts(val: str) -> datetime:
+                    v = val.replace("Z", "+00:00") if isinstance(val, str) and val.endswith("Z") else val
+                    return datetime.fromisoformat(v)  # noqa: DTZ006
+                s_ts = _parse_ts(start)
+                f_ts = _parse_ts(finish)
+                delta = (f_ts - s_ts).total_seconds()
+                if delta > 0:
+                    time_total = int(delta)
+                    avg_time_per_q = (time_total / total_questions) if total_questions else 0
+        except Exception:
+            pass
+    avg_time_theory = (sum(time_by_type["theory"]) / len(time_by_type["theory"])) if time_by_type["theory"] else 0
+    avg_time_coding = (sum(time_by_type["coding"]) / len(time_by_type["coding"])) if time_by_type["coding"] else 0
+    # fast/slow относительно среднего по всем вопросам
+    fast_count = 0
+    slow_count = 0
+    for q in questions:
+        t = (q.get("metrics") or {}).get("time_spent_sec") or 0
+        if avg_time_per_q:
+            if t < 0.5 * avg_time_per_q:
+                fast_count += 1
+            elif t > 1.5 * avg_time_per_q:
+                slow_count += 1
+
+    # Errors metrics
+    theory_incorrect = sum(1 for q in theory_q if (q.get("metrics") or {}).get("verdict") == "incorrect")
+    theory_partial = sum(1 for q in theory_q if (q.get("metrics") or {}).get("verdict") == "partial")
+    coding_failed = sum(
+        1
+        for q in coding_q
+        if not ((q.get("metrics") or {}).get("first_success_attempt"))
+    )
+    runtime_errors_total = sum((q.get("metrics") or {}).get("errors_count") or 0 for q in coding_q)
+    avg_attempts_per_coding = (coding_attempts / len(coding_q)) if coding_q else 0
+    hints_used_total = coding_hints
+
+    # По трекам
+    by_track: dict = {}
+    for q in questions:
+        track = q.get("track") or "unknown"
+        if track not in by_track:
+            by_track[track] = {
+                "score": 0,
+                "max_score": 0,
+                "questions": 0,
+            }
+        m = q.get("metrics") or {}
+        if q.get("q_type") == "theory":
+            by_track[track]["score"] += m.get("score") or 0
+            by_track[track]["max_score"] += m.get("max_score") or 0
+        else:
+            by_track[track]["score"] += m.get("score_code") or 0
+            by_track[track]["max_score"] += m.get("max_score_code") or 0
+        by_track[track]["questions"] += 1
+    # Добавляем ratio
+    for k, v in by_track.items():
+        max_val = v.get("max_score") or 0
+        v["score_ratio"] = (v.get("score") / max_val) if max_val else 0
+
     metrics = {
         "overall": {
-            "total_questions": total_questions,
-            "theory_questions": len(theory_q),
-            "coding_questions": len(coding_q),
-            "total_score": overall_score,
-            "max_total_score": overall_max,
-            "score_ratio": (overall_score / overall_max) if overall_max else 0,
+          "total_questions": total_questions,
+          "theory_questions": len(theory_q),
+          "coding_questions": len(coding_q),
+          "total_score": overall_score,
+          "max_total_score": overall_max,
+          "score_ratio": (overall_score / overall_max) if overall_max else 0,
+          "time_total_sec": time_total,
+          "avg_time_per_question_sec": avg_time_per_q,
         },
         "by_type": {
             "theory": {
-                "score": sum((q.get("metrics") or {}).get("score") or 0 for q in theory_q),
-                "max_score": sum((q.get("metrics") or {}).get("max_score") or 0 for q in theory_q),
-                "score_ratio": (sum((q.get("metrics") or {}).get("score") or 0 for q in theory_q) / sum((q.get("metrics") or {}).get("max_score") or 0 for q in theory_q)) if theory_q and sum((q.get("metrics") or {}).get("max_score") or 0 for q in theory_q) else 0,
+                "score": theory_score,
+                "max_score": theory_max,
+                "score_ratio": (theory_score / theory_max) if theory_max else 0,
+                "avg_score_per_question": (theory_score / len(theory_q)) if theory_q else 0,
             },
             "coding": {
-                "score": sum((q.get("metrics") or {}).get("score_code") or 0 for q in coding_q),
-                "max_score": sum((q.get("metrics") or {}).get("max_score_code") or 0 for q in coding_q),
-                "score_ratio": (sum((q.get("metrics") or {}).get("score_code") or 0 for q in coding_q) / sum((q.get("metrics") or {}).get("max_score_code") or 0 for q in coding_q)) if coding_q and sum((q.get("metrics") or {}).get("max_score_code") or 0 for q in coding_q) else 0,
-                "avg_attempts": (sum((q.get("metrics") or {}).get("attempts") or 0 for q in coding_q) / len(coding_q)) if coding_q else 0,
-                "avg_hints_used": (sum((q.get("metrics") or {}).get("hints_used") or 0 for q in coding_q) / len(coding_q)) if coding_q else 0,
+                "score": coding_score,
+                "max_score": coding_max,
+                "score_ratio": (coding_score / coding_max) if coding_max else 0,
+                "avg_attempts": (coding_attempts / len(coding_q)) if coding_q else 0,
+                "avg_hints_used": (coding_hints / len(coding_q)) if coding_q else 0,
             },
+        },
+        "by_track": by_track,
+        "anti_cheat": {
+            "suspicious_events": len(anti_rows),
+            "notes": "Подозрительных действий не зафиксировано" if not anti_rows else "Есть события анти-чит",
+        },
+        "errors": {
+            "theory_incorrect": theory_incorrect,
+            "theory_partial": theory_partial,
+            "coding_failed": coding_failed,
+            "runtime_errors_total": runtime_errors_total,
+            "avg_attempts_per_coding": avg_attempts_per_coding,
+            "hints_used_total": hints_used_total,
+        },
+        "speed": {
+            "avg_time_per_question_sec": avg_time_per_q,
+            "avg_time_theory_sec": avg_time_theory,
+            "avg_time_coding_sec": avg_time_coding,
+            "fast_questions_count": fast_count,
+            "slow_questions_count": slow_count,
         },
     }
     return {"metrics": metrics, "questions": questions}
 
 
-def build_full_session_summary(session_id: str) -> dict:
-    data = build_session_metrics(session_id)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+def build_full_session_summary(session_id: str, cur: Optional[sqlite3.Cursor] = None) -> dict:
+    local_conn = None
+    if cur is None:
+        local_conn = sqlite3.connect(DB_PATH)
+        cur = local_conn.cursor()
+    data = build_session_metrics(session_id, cur)
     session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,)))
     anti_rows = fetchall_dicts(cur.execute("SELECT * FROM interview_events WHERE sessionId=?", (session_id,)))
     anti = {"suspicious_events": len(anti_rows), "notes": "Подозрительных действий не зафиксировано" if not anti_rows else "Есть события анти-чит"}
@@ -593,9 +745,12 @@ def build_full_session_summary(session_id: str) -> dict:
         "owner_id": session_row.get("ownerId") if session_row else None,
         "track": session_row.get("direction") if session_row else None,
         "level": session_row.get("level") if session_row else None,
+        "started_at": session_row.get("startedAt") if session_row else None,
+        "finished_at": session_row.get("finishedAt") if session_row else None,
     }
     data["anti_cheat"] = anti
-    conn.close()
+    if local_conn:
+        local_conn.close()
     return data
 
 
@@ -608,47 +763,89 @@ SYSTEM_PROMPT_INTERVIEW_REPORT = """
 - честно, но аккуратно описать зоны роста,
 - дать рекомендации, куда двигаться дальше.
 
-Требования:
-- Пиши на русском языке.
-- Раздели отчёт на блоки с заголовками:
-  1) Итоговая оценка
-  2) Сильные стороны
-  3) Зоны роста
-  4) Рекомендации по развитию.
-- Не повторяй дословно тексты вопросов; пересказывай своими словами.
-- Используй данные о баллах, попытках, подсказках и покрытии key_points, чтобы делать выводы об уровне.
-- Отдельно отметь разницу между теорией и практикой (код).
-- Не придумывай факты, которых нет в данных (если чего-то не хватает, просто не упоминай это).
+ Структура отчёта (строго в таком порядке):
+ Итоговая оценка:
+ Сильные стороны:
+ Зоны роста:
+ Ошибки:
+ Скорость:
+ Рекомендации по развитию:
+
+ Требования к формату:
+ - Пиши на русском языке.
+ - НЕ используй Markdown и разметку:
+   - не пиши заголовки с символами # или ##,
+   - не используй списки с '-' или '*' в начале строки,
+   - не используй блоки кода ```.
+ - НЕ пиши литералы '\\n' или '/n' в тексте.
+ - Просто пиши обычный текст:
+   - каждую секцию начинай с названия, например: "Итоговая оценка:" на новой строке,
+   - внутри секции делай короткие абзацы, разделяя их реальным переводом строки.
+ - Не повторяй дословно тексты вопросов; пересказывай своими словами.
+ - Используй данные о баллах, попытках, подсказках и покрытии key_points, чтобы делать выводы об уровне.
+ - Отдельно отметь разницу между теорией и практикой (код).
+ - В разделе "Ошибки" опирайся на количества неправильных/частичных ответов по теории, неудачные кодовые попытки, runtime errors и срабатывания античита; раздели на логические, технические и поведенческие (античит) ошибки.
+ - В разделе "Скорость" используй реальные метрики времени: общее время, среднее на вопрос, среднее по теории/коду, количество быстрых/медленных вопросов; делай выводы об отношении скорости и качества.
+ - НЕЛЬЗЯ писать, что время не фиксировалось, если в данных есть метрики времени. Если поля отсутствуют, просто не делай выводов по этой части.
+ - Не придумывай факты, которых нет в данных (если чего-то не хватает, просто не упоминай это).
 """
 
 
 def build_user_prompt_interview_report(session_summary: dict) -> str:
-    return f"""
-Ниже приведены структурированные данные о собеседовании в формате JSON.
-
-Данные:
-```json
-{json.dumps(session_summary, ensure_ascii=False)}
-```
-
-На основе этих данных:
-
-Сформируй подробный, но компактный отчёт о кандидате.
-
-Соблюдай структуру: 'Итоговая оценка', 'Сильные стороны', 'Зоны роста', 'Рекомендации по развитию'.
-
-Особое внимание:
-
-какие темы кандидат раскрывал хорошо (по key_points и score_ratio),
-
-где часто не хватало ключевых пунктов,
-
-как он справлялся с задачами по коду (сколько попыток, сколько подсказок).
-"""
+    """
+    session_summary — словарь с метриками и уже нормализованными вопросами.
+    """
+    metrics = session_summary.get("metrics", {})
+    errors = metrics.get("errors", {})
+    speed = metrics.get("speed", {})
+    anti = session_summary.get("anti_cheat", {})
+    return (
+        "Ниже приведены структурированные данные о собеседовании в формате JSON (это ВХОДНЫЕ данные, их не нужно копировать в ответ):\n\n"
+        f"{json.dumps(session_summary, ensure_ascii=False)}\n\n"
+        "Ключевые агрегаты для анализа ошибок и скорости:\n"
+        f"- theory_incorrect: {errors.get('theory_incorrect')}\n"
+        f"- theory_partial: {errors.get('theory_partial')}\n"
+        f"- coding_failed: {errors.get('coding_failed')}\n"
+        f"- runtime_errors_total: {errors.get('runtime_errors_total')}\n"
+        f"- avg_attempts_per_coding: {errors.get('avg_attempts_per_coding')}\n"
+        f"- hints_used_total: {errors.get('hints_used_total')}\n"
+        f"- anti_cheat_events: {anti.get('events', 0)}\n"
+        f"- anti_cheat_has_suspicious: {anti.get('has_suspicious', False)}\n\n"
+        "Скорость:\n"
+        f"- total_time_sec: {metrics.get('overall', {}).get('time_total_sec')}\n"
+        f"- avg_time_per_question_sec: {speed.get('avg_time_per_question_sec')}\n"
+        f"- avg_time_theory_sec: {speed.get('avg_time_theory_sec')}\n"
+        f"- avg_time_coding_sec: {speed.get('avg_time_coding_sec')}\n"
+        f"- fast_questions_count: {speed.get('fast_questions_count')}\n"
+        f"- slow_questions_count: {speed.get('slow_questions_count')}\n\n"
+        "На основе этих данных:\n"
+        "- Сформируй отчёт строго с секциями: Итоговая оценка:, Сильные стороны:, Зоны роста:, Ошибки:, Скорость:, Рекомендации по развитию:.\n"
+        "- Соблюдай все ограничения по формату из system-подсказки.\n"
+        "- В ответе пиши только чистый текст отчёта, без JSON, без Markdown, без символов # и ```.\n"
+    )
 
 
 def generate_interview_reports_text(session_id: str) -> tuple[str, str]:
+    """
+    Генерирует две версии текста: для кандидата и для админа, на основе нормализованного summary.
+    """
     try:
+        # локальная санация текста
+        def sanitize_report_text(text: str) -> str:
+            if not text:
+                return ""
+            lines = []
+            for raw_line in text.splitlines():
+                line = raw_line.lstrip()
+                if line.startswith("#"):
+                    while line.startswith("#"):
+                        line = line[1:].lstrip()
+                lines.append(line)
+            cleaned = "\n".join(lines)
+            cleaned = cleaned.replace("\\n", " ").replace("/n", " ").replace("```", "")
+            cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+            return cleaned.strip()
+
         summary = build_full_session_summary(session_id)
         messages_candidate = [
             {"role": "system", "content": SYSTEM_PROMPT_INTERVIEW_REPORT},
@@ -661,6 +858,7 @@ def generate_interview_reports_text(session_id: str) -> tuple[str, str]:
             max_tokens=1500,
         )
         text_candidate = resp_cand.strip() if isinstance(resp_cand, str) else ""
+
         system_admin = SYSTEM_PROMPT_INTERVIEW_REPORT + """
 Дополнительно:
 - Пиши чуть более формально.
@@ -678,10 +876,279 @@ def generate_interview_reports_text(session_id: str) -> tuple[str, str]:
             max_tokens=1500,
         )
         text_admin = resp_admin.strip() if isinstance(resp_admin, str) else ""
-        return text_candidate or "Отчёт не сформирован", text_admin or "Отчёт не сформирован"
+
+        return sanitize_report_text(text_candidate) or "Отчёт не сформирован", sanitize_report_text(text_admin) or "Отчёт не сформирован"
     except Exception as exc:  # noqa: BLE001
         logger.warning("generate_interview_reports_text failed", extra={"error": str(exc)})
         return "Отчёт не сформирован", "Отчёт не сформирован"
+
+
+def safe_generate_interview_reports_text(session_id: str) -> tuple[str, str]:
+    try:
+        return generate_interview_reports_text(session_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("safe report generation failed", extra={"error": str(exc)})
+        return "Отчёт не сформирован", "Отчёт не сформирован"
+
+
+def generate_interview_report(session_id: str, owner_id: str, conn: sqlite3.Connection, force: bool = False) -> Optional[int]:
+    """
+    Высокоуровневая обёртка генерации отчёта с подробными логами.
+    """
+    logger.info("building interview report", extra={"session_id": session_id, "owner_id": owner_id})
+    cur = conn.cursor()
+    _ensure_report_tables(cur)
+    try:
+        logger.info("building summary for report", extra={"session_id": session_id})
+        summary = build_full_session_summary(session_id, cur)
+        logger.info("summary built", extra={"session_id": session_id})
+        logger.info("generating llm report texts", extra={"session_id": session_id})
+        candidate_text, admin_text = safe_generate_interview_reports_text(session_id)
+        logger.info("llm report texts generated", extra={"session_id": session_id})
+        report_id = generate_and_store_report(session_id, conn, force=force)
+        logger.info("report saved", extra={"session_id": session_id, "report_id": report_id})
+        return report_id
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("report generation at finish failed", extra={"session_id": session_id, "error": str(exc)})
+        raise
+
+
+def _ensure_report_tables(cur: sqlite3.Cursor):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interview_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            track TEXT NOT NULL,
+            level TEXT NOT NULL,
+            total_score REAL NOT NULL,
+            max_total_score REAL NOT NULL,
+            theory_score REAL NOT NULL,
+            theory_max_score REAL NOT NULL,
+            coding_score REAL NOT NULL,
+            coding_max_score REAL NOT NULL,
+            score_ratio REAL NOT NULL,
+            total_time_sec INTEGER NOT NULL,
+            avg_time_per_question_sec REAL NOT NULL,
+            anti_cheat_events INTEGER NOT NULL DEFAULT 0,
+            anti_cheat_flag INTEGER NOT NULL DEFAULT 0,
+            candidate_answer_text TEXT,
+            candidate_report_text TEXT NOT NULL,
+            admin_report_text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    # Апгрейд старых схем: добавляем недостающие столбцы, если таблица уже существовала
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(interview_reports)").fetchall()]
+    def _ensure_col(name: str, ddl: str):
+        if name not in cols:
+            try:
+                cur.execute(f"ALTER TABLE interview_reports ADD COLUMN {name} {ddl}")
+            except sqlite3.OperationalError:
+                pass
+    for name, ddl in [
+        ("session_id", "TEXT"),
+        ("owner_id", "TEXT"),
+        ("track", "TEXT"),
+        ("level", "TEXT"),
+        ("total_score", "REAL"),
+        ("max_total_score", "REAL"),
+        ("theory_score", "REAL"),
+        ("theory_max_score", "REAL"),
+        ("coding_score", "REAL"),
+        ("coding_max_score", "REAL"),
+        ("score_ratio", "REAL"),
+        ("total_time_sec", "INTEGER"),
+        ("avg_time_per_question_sec", "REAL"),
+        ("anti_cheat_events", "INTEGER"),
+        ("anti_cheat_flag", "INTEGER"),
+        ("candidate_answer_text", "TEXT"),
+        ("candidate_report_text", "TEXT"),
+        ("admin_report_text", "TEXT"),
+    ]:
+        _ensure_col(name, ddl)
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interview_report_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER NOT NULL,
+            question_id TEXT NOT NULL,
+            question_order INTEGER NOT NULL,
+            q_type TEXT NOT NULL,
+            track TEXT NOT NULL,
+            level TEXT NOT NULL,
+            category TEXT,
+            title TEXT NOT NULL,
+            topic TEXT,
+            score REAL NOT NULL,
+            max_score REAL NOT NULL,
+            score_ratio REAL NOT NULL,
+            time_spent_sec INTEGER NOT NULL,
+            verdict TEXT,
+            covered_points TEXT,
+            missing_points TEXT,
+            feedback_short TEXT,
+            feedback_detailed TEXT,
+            attempts INTEGER,
+            first_success_attempt INTEGER,
+            hints_used INTEGER,
+            public_tests_total INTEGER,
+            public_tests_passed INTEGER,
+            hidden_tests_total INTEGER,
+            hidden_tests_passed INTEGER,
+            runtime_errors_count INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (report_id) REFERENCES interview_reports(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cols_q = [r[1] for r in cur.execute("PRAGMA table_info(interview_report_questions)").fetchall()]
+    def _ensure_col_q(name: str, ddl: str):
+        if name not in cols_q:
+            try:
+                cur.execute(f"ALTER TABLE interview_report_questions ADD COLUMN {name} {ddl}")
+            except sqlite3.OperationalError:
+                pass
+    for name, ddl in [
+        ("topic", "TEXT"),
+        ("runtime_errors_count", "INTEGER"),
+        ("covered_points", "TEXT"),
+        ("missing_points", "TEXT"),
+        ("feedback_short", "TEXT"),
+        ("feedback_detailed", "TEXT"),
+        ("attempts", "INTEGER"),
+        ("first_success_attempt", "INTEGER"),
+        ("hints_used", "INTEGER"),
+        ("public_tests_total", "INTEGER"),
+        ("public_tests_passed", "INTEGER"),
+        ("hidden_tests_total", "INTEGER"),
+        ("hidden_tests_passed", "INTEGER"),
+        ("score_ratio", "REAL"),
+        ("time_spent_sec", "INTEGER"),
+        ("user_answer", "TEXT"),
+    ]:
+        _ensure_col_q(name, ddl)
+
+
+def generate_and_store_report(session_id: str, conn: sqlite3.Connection, force: bool = False) -> Optional[int]:
+    """
+    Строит summary, генерирует тексты и сохраняет отчёт и детали в БД. Возвращает id отчёта.
+    """
+    cur = conn.cursor()
+    _ensure_report_tables(cur)
+    existing = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE session_id=? OR sessionId=?", (session_id, session_id)))
+    if existing and not force:
+        return existing.get("id")
+    if existing and force:
+        try:
+            cur.execute("DELETE FROM interview_report_questions WHERE report_id=?", (existing.get("id"),))
+            cur.execute("DELETE FROM interview_reports WHERE id=?", (existing.get("id"),))
+        except Exception:
+            pass
+    session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,)))
+    if not session_row:
+        return None
+    # Используем текущий курсор, чтобы избежать блокировок
+    summary = build_full_session_summary(session_id, cur)
+    cand_text, admin_text = safe_generate_interview_reports_text(session_id)
+    metrics_overall = (summary.get("metrics") or {}).get("overall") or {}
+    by_type = (summary.get("metrics") or {}).get("by_type") or {}
+    anti = summary.get("anti_cheat") or {}
+    total_score = metrics_overall.get("total_score") or 0
+    max_total_score = metrics_overall.get("max_total_score") or 0
+    theory_score = (by_type.get("theory") or {}).get("score") or 0
+    theory_max_score = (by_type.get("theory") or {}).get("max_score") or 0
+    coding_score = (by_type.get("coding") or {}).get("score") or 0
+    coding_max_score = (by_type.get("coding") or {}).get("max_score") or 0
+    total_time_sec = metrics_overall.get("time_total_sec") or 0
+    avg_time = metrics_overall.get("avg_time_per_question_sec") or 0
+    score_ratio = (total_score / max_total_score) if max_total_score else 0
+    anti_events = anti.get("suspicious_events") or 0
+    anti_flag = 1 if anti_events else 0
+    with conn:
+        # Динамическая вставка с учётом схемы
+        rep_cols = [r[1] for r in cur.execute("PRAGMA table_info(interview_reports)").fetchall()]
+        values_map = {
+            "session_id": session_id,
+            "sessionId": session_id,
+            "owner_id": session_row.get("ownerId") or "",
+            "ownerId": session_row.get("ownerId") or "",
+            "track": session_row.get("direction") or "unknown",
+            "level": session_row.get("level") or "unknown",
+            "total_score": total_score,
+            "max_total_score": max_total_score,
+            "theory_score": theory_score,
+            "theory_max_score": theory_max_score,
+            "coding_score": coding_score,
+            "coding_max_score": coding_max_score,
+            "score_ratio": score_ratio,
+            "total_time_sec": total_time_sec,
+            "avg_time_per_question_sec": avg_time,
+            "anti_cheat_events": anti_events,
+            "anti_cheat_flag": anti_flag,
+            "candidate_report_text": cand_text or "",
+            "admin_report_text": admin_text or "",
+            "candidate_answer_text": cand_text or "",
+            "metrics_json": json.dumps(summary.get("metrics") or {}, ensure_ascii=False),
+            "questions_json": json.dumps(summary.get("questions") or [], ensure_ascii=False),
+            "summary_candidate": cand_text or "",
+            "summary_admin": admin_text or "",
+            "recommendations_json": json.dumps(summary.get("anti_cheat") or {}, ensure_ascii=False),
+        }
+        col_order = [c for c in values_map.keys() if c in rep_cols]
+        placeholders = ", ".join("?" for _ in col_order)
+        cur.execute(
+            f"INSERT INTO interview_reports ({', '.join(col_order)}) VALUES ({placeholders})",
+            [values_map.get(c) for c in col_order],
+        )
+        rep_id = cur.lastrowid
+        # детали по вопросам
+        question_cols = [r[1] for r in cur.execute("PRAGMA table_info(interview_report_questions)").fetchall()]
+        for q in summary.get("questions") or []:
+            m = q.get("metrics") or {}
+            q_type = q.get("q_type")
+            score_val = m.get("score") if q_type == "theory" else m.get("score_code")
+            max_score_val = m.get("max_score") if q_type == "theory" else m.get("max_score_code")
+            score_ratio_val = (score_val / max_score_val) if max_score_val else 0
+            values_q = {
+                "report_id": rep_id,
+                "question_id": q.get("question_id"),
+                "question_order": q.get("order") or 0,
+                "q_type": q_type,
+                "track": q.get("track"),
+                "level": q.get("level"),
+                "category": q.get("category"),
+                "title": q.get("title"),
+                "topic": q.get("topic"),
+                "score": score_val or 0,
+                "max_score": max_score_val or 0,
+                "score_ratio": score_ratio_val,
+                "time_spent_sec": m.get("time_spent_sec") or 0,
+                "verdict": m.get("verdict"),
+                "covered_points": json.dumps((q.get("llm_evaluation") or {}).get("covered_points") or [], ensure_ascii=False),
+                "missing_points": json.dumps((q.get("llm_evaluation") or {}).get("missing_points") or [], ensure_ascii=False),
+                "feedback_short": m.get("llm_feedback_short"),
+                "feedback_detailed": m.get("llm_feedback_detailed"),
+                "attempts": m.get("attempts"),
+                "first_success_attempt": m.get("first_success_attempt"),
+                "hints_used": m.get("hints_used"),
+                "public_tests_total": m.get("public_tests_total"),
+                "public_tests_passed": m.get("public_tests_passed"),
+                "hidden_tests_total": m.get("hidden_tests_total"),
+                "hidden_tests_passed": m.get("hidden_tests_passed"),
+                "runtime_errors_count": m.get("errors_count"),
+                "user_answer": None,
+            }
+            col_order_q = [c for c in values_q.keys() if c in question_cols]
+            placeholders_q = ", ".join("?" for _ in col_order_q)
+            cur.execute(
+                f"INSERT INTO interview_report_questions ({', '.join(col_order_q)}) VALUES ({placeholders_q})",
+                [values_q.get(c) for c in col_order_q],
+            )
+    return rep_id
 
 
 @app.post("/api/code/hint")
@@ -1379,8 +1846,61 @@ def check(session_id: str):
 def report(report_id: str, download: Optional[int] = 0):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    # ensure tables exist and upgrade if нужно
+    _ensure_report_tables(cur)
     # Пытаемся найти новый отчёт
-    rep = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE id=? OR sessionId=?", (report_id, report_id)))
+    try:
+        rep = fetchone_dict(
+            cur.execute(
+                "SELECT * FROM interview_reports WHERE id=? OR session_id=? OR sessionId=?",
+                (report_id, report_id, report_id),
+            )
+        )
+    except sqlite3.OperationalError:
+        rep = None
+    if rep:
+        # Быстрый возврат с учётом старых колонок (sessionId, summary_candidate, metrics_json, questions_json)
+        try:
+            parsed_metrics = json.loads(rep.get("metrics_json") or "{}")
+        except Exception:
+            parsed_metrics = {}
+        overall_parsed = parsed_metrics.get("overall") or {}
+        speed_parsed = parsed_metrics.get("speed") or {}
+        errors_parsed = parsed_metrics.get("errors") or {}
+        try:
+            q_rows = json.loads(rep.get("questions_json") or "[]")
+        except Exception:
+            q_rows = []
+        total_time = rep.get("total_time_sec") or overall_parsed.get("time_total_sec") or 0
+        avg_per_q = rep.get("avg_time_per_question_sec") or overall_parsed.get("avg_time_per_question_sec") or 0
+        response = {
+            "report": {
+                "id": rep.get("id"),
+                "sessionId": rep.get("session_id") or rep.get("sessionId"),
+                "ownerId": rep.get("owner_id") or rep.get("ownerId"),
+                "track": rep.get("track"),
+                "level": rep.get("level"),
+                "candidate_report_text": rep.get("candidate_answer_text") or rep.get("candidate_report_text") or rep.get("summary_candidate"),
+                "admin_report_text": rep.get("admin_report_text") or rep.get("summary_admin"),
+                "metrics": {
+                    "overall": {
+                        "total_score": rep.get("total_score") or overall_parsed.get("total_score"),
+                        "max_total_score": rep.get("max_total_score") or overall_parsed.get("max_total_score"),
+                        "score_ratio": rep.get("score_ratio") or overall_parsed.get("score_ratio"),
+                        "total_time_sec": total_time,
+                        "avg_time_per_question_sec": avg_per_q,
+                    },
+                    "speed": speed_parsed,
+                    "errors": errors_parsed,
+                },
+                "questions": q_rows,
+                "summary_candidate": rep.get("candidate_answer_text") or rep.get("candidate_report_text") or rep.get("summary_candidate"),
+                "summary_admin": rep.get("admin_report_text") or rep.get("summary_admin"),
+            }
+        }
+        conn.close()
+        return response
+
     if not rep:
         # попробуем сгенерировать на лету
         session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (report_id,)))
@@ -1388,75 +1908,250 @@ def report(report_id: str, download: Optional[int] = 0):
             try:
                 summary = build_full_session_summary(report_id)
                 cand_text, admin_text = generate_interview_reports_text(report_id)
-                rep_id = str(uuid.uuid4())
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO interview_reports (id, sessionId, ownerId, track, level, metrics_json, questions_json, summary_candidate, summary_admin, recommendations_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        rep_id,
-                        report_id,
-                        session_row.get("ownerId"),
-                        session_row.get("direction"),
-                        session_row.get("level"),
-                        json.dumps(summary.get("metrics") or {}),
-                        json.dumps(summary.get("questions") or []),
-                        cand_text,
-                        admin_text,
-                        json.dumps(summary.get("anti_cheat") or {}),
-                    ),
-                )
-                conn.commit()
-                rep = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE id=?", (rep_id,)))
+                metrics_overall = (summary.get("metrics") or {}).get("overall") or {}
+                by_type = (summary.get("metrics") or {}).get("by_type") or {}
+                anti = summary.get("anti_cheat") or {}
+                total_score = metrics_overall.get("total_score") or 0
+                max_total_score = metrics_overall.get("max_total_score") or 0
+                theory_score = (by_type.get("theory") or {}).get("score") or 0
+                theory_max_score = (by_type.get("theory") or {}).get("max_score") or 0
+                coding_score = (by_type.get("coding") or {}).get("score") or 0
+                coding_max_score = (by_type.get("coding") or {}).get("max_score") or 0
+                total_time_sec = metrics_overall.get("time_total_sec") or 0
+                avg_time = metrics_overall.get("avg_time_per_question_sec") or 0
+                score_ratio = (total_score / max_total_score) if max_total_score else 0
+                anti_events = anti.get("suspicious_events") or 0
+                anti_flag = 1 if anti_events else 0
+                with conn:
+                    cur.execute(
+                        """
+                        INSERT INTO interview_reports (
+                            session_id, owner_id, track, level,
+                            total_score, max_total_score, theory_score, theory_max_score,
+                            coding_score, coding_max_score, score_ratio,
+                            total_time_sec, avg_time_per_question_sec,
+                            anti_cheat_events, anti_cheat_flag,
+                            candidate_report_text, admin_report_text
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            report_id,
+                            session_row.get("ownerId"),
+                            session_row.get("direction"),
+                            session_row.get("level"),
+                            total_score,
+                            max_total_score,
+                            theory_score,
+                            theory_max_score,
+                            coding_score,
+                            coding_max_score,
+                            score_ratio,
+                            total_time_sec,
+                            avg_time,
+                            anti_events,
+                            anti_flag,
+                            cand_text,
+                            admin_text,
+                        ),
+                    )
+                    rep_id = cur.lastrowid
+                    # детальные вопросы
+                    for q in summary.get("questions") or []:
+                        m = q.get("metrics") or {}
+                        q_type = q.get("q_type")
+                        score_val = m.get("score") if q_type == "theory" else m.get("score_code")
+                        max_score_val = m.get("max_score") if q_type == "theory" else m.get("max_score_code")
+                        score_ratio_val = (score_val / max_score_val) if max_score_val else 0
+                        verdict = m.get("verdict") or (q.get("llm_evaluation") or {}).get("verdict")
+                        covered_points = json.dumps((q.get("llm_evaluation") or {}).get("covered_points") or [], ensure_ascii=False)
+                        missing_points = json.dumps((q.get("llm_evaluation") or {}).get("missing_points") or [], ensure_ascii=False)
+                        feedback_short = (q.get("metrics") or {}).get("llm_feedback_short")
+                        feedback_detailed = (q.get("metrics") or {}).get("llm_feedback_detailed")
+                        attempts = m.get("attempts")
+                        first_success = m.get("first_success_attempt")
+                        hints_used = m.get("hints_used")
+                        public_tests_total = m.get("public_tests_total")
+                        public_tests_passed = m.get("public_tests_passed")
+                        hidden_tests_total = m.get("hidden_tests_total")
+                        hidden_tests_passed = m.get("hidden_tests_passed")
+                        runtime_errors = m.get("errors_count")
+                        cur.execute(
+                            """
+                            INSERT INTO interview_report_questions (
+                                report_id, question_id, question_order,
+                                q_type, track, level, category, title, topic,
+                                score, max_score, score_ratio, time_spent_sec,
+                                verdict, covered_points, missing_points,
+                                feedback_short, feedback_detailed,
+                                attempts, first_success_attempt, hints_used,
+                                public_tests_total, public_tests_passed,
+                                hidden_tests_total, hidden_tests_passed,
+                                runtime_errors_count
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                rep_id,
+                                q.get("question_id"),
+                                q.get("order") or 0,
+                                q_type,
+                                q.get("track"),
+                                q.get("level"),
+                                q.get("category"),
+                                q.get("title"),
+                                q.get("topic"),
+                                score_val or 0,
+                                max_score_val or 0,
+                                score_ratio_val,
+                                m.get("time_spent_sec") or 0,
+                                verdict,
+                                covered_points,
+                                missing_points,
+                                feedback_short,
+                                feedback_detailed,
+                                attempts,
+                                first_success,
+                                hints_used,
+                                public_tests_total,
+                                public_tests_passed,
+                                hidden_tests_total,
+                                hidden_tests_passed,
+                                runtime_errors,
+                            ),
+                        )
+                    rep = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE id=?", (rep_id,)))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("on-demand report generation failed", extra={"error": str(exc)})
-    if rep:
-        conn.close()
-        if download:
-            # формируем имя файла: YYYY-MM-DD_track_level.txt
-            fname_parts = []
-            try:
-                sess = fetchone_dict(sqlite3.connect(DB_PATH).cursor().execute("SELECT * FROM sessions WHERE id=?", (rep.get("sessionId"),)))
-                if sess and sess.get("createdAt"):
-                    fname_parts.append(sess.get("createdAt")[0:10])
-                if sess and sess.get("direction"):
-                    fname_parts.append(sess.get("direction"))
-                if sess and sess.get("level"):
-                    fname_parts.append(sess.get("level"))
-            except Exception:
-                pass
-            fname = "_".join([p for p in fname_parts if p]) or "report"
-            return PlainTextResponse(rep.get("summary_candidate") or "Отчёт отсутствует", headers={"Content-Disposition": f"attachment; filename=\"%s.txt\"" % fname})
-        return {
-            "report": {
+        if rep:
+            # если текст пустой — пробуем пересоздать отчёт
+            if (not rep.get("candidate_report_text") or rep.get("candidate_report_text") == "Отчёт не сформирован" or rep.get("total_time_sec") is None):
+                try:
+                    generate_interview_report(rep.get("session_id") or rep.get("sessionId"), rep.get("owner_id") or rep.get("ownerId") or "", conn, force=True)
+                    rep = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE id=?", (rep.get("id"),)))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("regen report failed", extra={"err": str(exc)})
+            # загрузим вопросы
+            q_rows = fetchall_dicts(
+                cur.execute(
+                    "SELECT * FROM interview_report_questions WHERE report_id=? ORDER BY question_order",
+                    (rep.get("id"),),
+                )
+            )
+            if download:
+                # формируем имя файла: YYYY-MM-DD_track_level.txt
+                fname_parts = []
+                try:
+                    sess = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (rep.get("session_id"),)))
+                    if sess and sess.get("createdAt"):
+                        fname_parts.append(sess.get("createdAt")[0:10])
+                    if sess and sess.get("direction"):
+                        fname_parts.append(sess.get("direction"))
+                    if sess and sess.get("level"):
+                        fname_parts.append(sess.get("level"))
+                except Exception:
+                    pass
+                fname = "_".join([p for p in fname_parts if p]) or "report"
+                conn.close()
+                return PlainTextResponse(rep.get("candidate_report_text") or "Отчёт отсутствует", headers={"Content-Disposition": f"attachment; filename=\"%s.txt\"" % fname})
+            # вычислим speed/errors на основе вопросов
+            total_time = rep.get("total_time_sec") or 0
+            avg_per_q = rep.get("avg_time_per_question_sec") or 0
+            theory_times = [q.get("time_spent_sec") or 0 for q in q_rows if q.get("q_type") == "theory"]
+            coding_times = [q.get("time_spent_sec") or 0 for q in q_rows if q.get("q_type") == "coding"]
+            avg_theory_time = sum(theory_times) / len(theory_times) if theory_times else 0
+            avg_coding_time = sum(coding_times) / len(coding_times) if coding_times else 0
+            if not total_time:
+                try:
+                    sess = fetchone_dict(cur.execute("SELECT startedAt, finishedAt FROM sessions WHERE id=?", (rep.get("session_id"),)))
+                    if sess and sess.get("startedAt") and sess.get("finishedAt"):
+                        def _parse_ts(val: str) -> datetime:
+                            v = val.replace("Z", "+00:00") if isinstance(val, str) and val.endswith("Z") else val
+                            return datetime.fromisoformat(v)  # noqa: DTZ006
+                        delta = (_parse_ts(sess["finishedAt"]) - _parse_ts(sess["startedAt"])).total_seconds()
+                        if delta > 0:
+                            total_time = int(delta)
+                            avg_per_q = total_time / max(len(q_rows), 1)
+                except Exception:
+                    pass
+            fast_count = sum(1 for q in q_rows if avg_per_q and (q.get("time_spent_sec") or 0) < 0.5 * avg_per_q)
+            slow_count = sum(1 for q in q_rows if avg_per_q and (q.get("time_spent_sec") or 0) > 1.5 * avg_per_q)
+            theory_incorrect = sum(1 for q in q_rows if q.get("q_type") == "theory" and q.get("verdict") == "incorrect")
+            theory_partial = sum(1 for q in q_rows if q.get("q_type") == "theory" and q.get("verdict") == "partial")
+            coding_failed = sum(1 for q in q_rows if q.get("q_type") == "coding" and (q.get("first_success_attempt") is None or q.get("first_success_attempt") == 0))
+            runtime_errors_total = sum(q.get("runtime_errors_count") or 0 for q in q_rows if q.get("q_type") == "coding")
+            avg_attempts_per_coding = (
+                sum(q.get("attempts") or 0 for q in q_rows if q.get("q_type") == "coding") / len([q for q in q_rows if q.get("q_type") == "coding"])
+                if [q for q in q_rows if q.get("q_type") == "coding"]
+                else 0
+            )
+            hints_used_total = sum(q.get("hints_used") or 0 for q in q_rows if q.get("q_type") == "coding")
+            report_payload = {
                 "id": rep.get("id"),
-                "sessionId": rep.get("sessionId"),
-                "ownerId": rep.get("ownerId"),
+                "sessionId": rep.get("session_id"),
+                "ownerId": rep.get("owner_id"),
                 "track": rep.get("track"),
                 "level": rep.get("level"),
-                "metrics": json.loads(rep.get("metrics_json") or "{}"),
-                "questions": json.loads(rep.get("questions_json") or "[]"),
-                "summary_candidate": rep.get("summary_candidate"),
-                "summary_admin": rep.get("summary_admin"),
-                "recommendations": json.loads(rep.get("recommendations_json") or "{}"),
+                "metrics": {
+                    "overall": {
+                        "total_score": rep.get("total_score"),
+                        "max_total_score": rep.get("max_total_score"),
+                        "score_ratio": rep.get("score_ratio"),
+                        "total_time_sec": total_time,
+                        "avg_time_per_question_sec": avg_per_q,
+                        "theory_score": rep.get("theory_score"),
+                        "coding_score": rep.get("coding_score"),
+                    },
+                    "speed": {
+                        "avg_time_per_question_sec": avg_per_q,
+                        "avg_time_theory_sec": avg_theory_time,
+                        "avg_time_coding_sec": avg_coding_time,
+                        "fast_questions_count": fast_count,
+                        "slow_questions_count": slow_count,
+                    },
+                    "errors": {
+                        "theory_incorrect": theory_incorrect,
+                        "theory_partial": theory_partial,
+                        "coding_failed": coding_failed,
+                        "runtime_errors_total": runtime_errors_total,
+                        "avg_attempts_per_coding": avg_attempts_per_coding,
+                        "hints_used_total": hints_used_total,
+                    },
+                },
+                "questions": q_rows,
+                "summary_candidate": rep.get("candidate_report_text") or rep.get("summary_candidate"),
+                "summary_admin": rep.get("admin_report_text") or rep.get("summary_admin"),
+                "recommendations": {"anti_cheat_events": rep.get("anti_cheat_events"), "anti_cheat_flag": rep.get("anti_cheat_flag")},
+                "candidate_report_text": rep.get("candidate_report_text") or rep.get("summary_candidate"),
+                "admin_report_text": rep.get("admin_report_text") or rep.get("summary_admin"),
             }
-        }
+            cand_answer = (rep.get("candidate_answer_text") or "").strip() if isinstance(rep.get("candidate_answer_text"), str) else rep.get("candidate_answer_text")
+            if cand_answer:
+                report_payload["candidate_answer_text"] = cand_answer
+            return {"report": report_payload}
     # старый fallback
     cur.execute("SELECT * FROM reports WHERE id=?", (report_id,))
     row = fetchone_dict(cur)
     conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail="not_found")
+    if row:
+        return {
+            "report": {
+                "id": row["id"],
+                "score": row.get("score", 0),
+                "level": row.get("level"),
+                "summary": row.get("summary", ""),
+                "timeline": [],
+                "solutions": [],
+                "analytics": {},
+            }
+        }
+    # ничего не нашли — вернём пустой отчёт вместо 404, чтобы фронт мог показать текст
     return {
         "report": {
-            "id": row["id"],
-            "score": row.get("score", 0),
-            "level": row.get("level"),
-            "summary": row.get("summary", ""),
-            "timeline": [],
-            "solutions": [],
-            "analytics": {},
+            "id": report_id,
+            "summary": "Отчёт не найден в текущей базе",
+            "score": 0,
+            "level": "",
+            "metrics": {},
+            "questions": [],
         }
     }
 
@@ -2858,12 +3553,22 @@ def finish_interview(payload: FinishInterviewPayload):
             conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
             conn.execute("PRAGMA busy_timeout=5000")
             cur = conn.cursor()
+            try:
+                cols = [r[1] for r in cur.execute("PRAGMA table_info(sessions)").fetchall()]
+                if "finishedAt" not in cols:
+                    cur.execute("ALTER TABLE sessions ADD COLUMN finishedAt TEXT")
+            except Exception:
+                pass
             cur.execute("SELECT * FROM sessions WHERE id=?", (payload.sessionId,))
             session = fetchone_dict(cur)
             if not session:
                 return {"status": "missing"}
             cur.execute("UPDATE sessions SET status='completed', is_active=0, is_finished=1 WHERE id=?", (payload.sessionId,))
             finished_at = now_iso()
+            try:
+                cur.execute("UPDATE sessions SET finishedAt=? WHERE id=?", (finished_at, payload.sessionId))
+            except Exception:
+                pass
             total_score = calculate_session_score(cur, payload.sessionId)
             cur.execute(
                 "INSERT OR REPLACE INTO interview_results (id, sessionId, ownerId, status, finishedAt, score) VALUES (?, ?, ?, ?, ?, ?)",
@@ -2877,9 +3582,17 @@ def finish_interview(payload: FinishInterviewPayload):
                     "UPDATE assigned_interviews SET status='completed', sessionId=? WHERE id=?",
                     (payload.sessionId, session.get("assignedId")),
                 )
-            # Генерируем отчёт
-            # Генерация отчёта отключена, пока сохраняем только итоговый score
-            return {"status": "ok", "score": total_score}
+            try:
+                report_id = generate_interview_report(payload.sessionId, payload.ownerId or "", conn)
+                return {"status": "ok", "score": total_score, "report_id": report_id}
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("report generation at finish failed", extra={"session_id": payload.sessionId})
+                return {
+                    "status": "error",
+                    "message": "report generation at finish failed",
+                    "error": str(exc),
+                    "score": total_score,
+                }
         except sqlite3.OperationalError as exc:  # noqa: BLE001
             last_err = exc
             time.sleep(0.3)
