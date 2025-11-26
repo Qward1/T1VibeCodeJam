@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
@@ -36,6 +37,7 @@ from llm_theory import (
     TheoryDecision,
 )
 from llm_code import generate_code_task, parse_function_name, build_tests_for_task, explain_code_error, generate_code_hint
+from llm_client import chat_completion
 from question_utils import (
     pick_question,
     normalize_task_types,
@@ -371,6 +373,317 @@ def _candidate_languages(task: dict, requested: Optional[str]) -> List[str]:
     return langs or [requested or "python"]
 
 
+# ---------- Нормализованный отчёт
+
+def _load_answer(cur, session_id: str, question_id: str) -> Optional[dict]:
+    return fetchone_dict(
+        cur.execute(
+            "SELECT * FROM answers WHERE sessionId=? AND questionId=?",
+            (session_id, question_id),
+        )
+    )
+
+
+def _load_code_attempts(cur, session_id: str, question_id: str, task_id: Optional[str]) -> List[dict]:
+    if not task_id:
+        return []
+    return fetchall_dicts(
+        cur.execute(
+            """
+            SELECT * FROM code_attempts
+            WHERE session_id=? AND question_id=? AND task_id=?
+            ORDER BY attempt_number ASC
+            """,
+            (session_id, question_id, task_id),
+        )
+    )
+
+
+def _load_hints(cur, session_id: str, question_id: str) -> List[str]:
+    rows = fetchall_dicts(
+        cur.execute(
+            "SELECT content FROM messages WHERE sessionId=? AND questionId=? AND source='hint' ORDER BY datetime(createdAt) ASC",
+            (session_id, question_id),
+        )
+    )
+    return [r.get("content") for r in rows if r.get("content")]
+
+
+def _load_error_hints(cur, session_id: str, question_id: str) -> List[str]:
+    rows = fetchall_dicts(
+        cur.execute(
+            "SELECT content FROM messages WHERE sessionId=? AND questionId=? AND source='code_error_hint' ORDER BY datetime(createdAt) ASC",
+            (session_id, question_id),
+        )
+    )
+    return [r.get("content") for r in rows if r.get("content")]
+
+
+def build_normalized_question_report(session_id: str, question_id: str, session_row: dict, cur=None) -> dict:
+    local_conn = None
+    if cur is None:
+        local_conn = sqlite3.connect(DB_PATH)
+        cur = local_conn.cursor()
+    sq = fetchone_dict(cur.execute("SELECT * FROM session_questions WHERE sessionId=? AND questionId=?", (session_id, question_id)))
+    if not sq:
+        return {}
+    q_type = sq.get("q_type") or ("coding" if sq.get("code_task_id") else "theory")
+    order = sq.get("position") or 0
+    meta = {}
+    if sq.get("meta_json"):
+        try:
+            meta = json.loads(sq.get("meta_json"))
+        except Exception:
+            meta = {}
+    base = {
+        "question_id": question_id,
+        "order": order,
+        "q_type": q_type,
+        "track": session_row.get("direction"),
+        "level": session_row.get("level"),
+        "title": sq.get("questionTitle") or meta.get("title"),
+        "category": sq.get("category"),
+        "raw_prompt": meta.get("prompt") if isinstance(meta, dict) else None,
+        "raw_llm_question": meta or {},
+    }
+    metrics = {
+        "time_spent_sec": None,
+        "started_at": session_row.get("startedAt"),
+        "finished_at": None,
+    }
+    llm_eval = None
+    code_task = None
+    code_attempts = []
+    hints = _load_hints(cur, session_id, question_id)
+    error_hints = _load_error_hints(cur, session_id, question_id)
+
+    if q_type == "theory":
+        ans = _load_answer(cur, session_id, question_id) or {}
+        score = ans.get("score") or 0
+        max_score = ans.get("max_score") or meta.get("max_score") or 10
+        decision = ans.get("decision")
+        metrics.update(
+            {
+                "score": score,
+                "max_score": max_score,
+                "score_ratio": (score / max_score) if max_score else 0,
+                "verdict": decision,
+                "key_points": [],
+                "llm_feedback_short": ans.get("feedback_short"),
+                "llm_feedback_detailed": ans.get("feedback_detailed"),
+            }
+        )
+        llm_eval = {
+            "score": score,
+            "max_score": max_score,
+            "verdict": decision,
+            "covered_points": ans.get("covered_points"),
+            "missing_points": ans.get("missing_points"),
+        }
+    else:
+        task_id = sq.get("code_task_id")
+        code_task = None
+        if task_id:
+            code_task = fetchone_dict(cur.execute("SELECT * FROM code_tasks WHERE task_id=?", (task_id,)))
+        attempts = _load_code_attempts(cur, session_id, question_id, task_id)
+        code_attempts = attempts
+        attempts_num = len(attempts)
+        score_vals = [a.get("score") or 0 for a in attempts]
+        final_score = score_vals[-1] if attempts else 0
+        max_score = max([a.get("score") or 0 for a in attempts] + [code_task.get("max_score", 0) if code_task else 10])
+        if not max_score:
+            max_score = 10
+        hints_used = sq.get("hints_used") or 0
+        first_success = None
+        for a in attempts:
+            if a.get("passed_public") and a.get("passed_hidden"):
+                first_success = a.get("attempt_number")
+                break
+        public_tests_total = len(fetchall_dicts(cur.execute("SELECT id FROM code_tests WHERE task_id=? AND is_public=1", (task_id,)))) if task_id else 0
+        hidden_tests_total = len(fetchall_dicts(cur.execute("SELECT id FROM code_tests WHERE task_id=? AND is_public=0", (task_id,)))) if task_id else 0
+        metrics.update(
+            {
+                "attempts": attempts_num,
+                "score_code": final_score,
+                "max_score_code": max_score,
+                "score_ratio_code": (final_score / max_score) if max_score else 0,
+                "public_tests_total": public_tests_total,
+                "public_tests_passed": public_tests_total if first_success else 0,
+                "hidden_tests_total": hidden_tests_total,
+                "hidden_tests_passed": hidden_tests_total if first_success else 0,
+                "hints_used": hints_used,
+                "errors_count": attempts_num - (1 if first_success else 0),
+                "first_success_attempt": first_success,
+            }
+        )
+
+    out = {
+        **base,
+        "metrics": metrics,
+        "llm_evaluation": llm_eval,
+        "code_task": code_task,
+        "code_attempts": code_attempts,
+        "hints": hints,
+        "error_explanations": error_hints,
+    }
+    if local_conn:
+        local_conn.close()
+    return out
+
+
+def build_session_metrics(session_id: str) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,)))
+    if not session_row:
+        conn.close()
+        return {}
+    sq_rows = fetchall_dicts(cur.execute("SELECT questionId FROM session_questions WHERE sessionId=? ORDER BY position", (session_id,)))
+    questions = [build_normalized_question_report(session_id, r["questionId"], session_row, cur) for r in sq_rows if r.get("questionId")]
+    conn.close()
+    overall_score = 0
+    overall_max = 0
+    total_questions = len(questions)
+    theory_q = [q for q in questions if q.get("q_type") == "theory"]
+    coding_q = [q for q in questions if q.get("q_type") == "coding"]
+    for q in questions:
+        m = q.get("metrics") or {}
+        if q.get("q_type") == "theory":
+            overall_score += m.get("score") or 0
+            overall_max += m.get("max_score") or 0
+        else:
+            overall_score += m.get("score_code") or 0
+            overall_max += m.get("max_score_code") or 0
+    metrics = {
+        "overall": {
+            "total_questions": total_questions,
+            "theory_questions": len(theory_q),
+            "coding_questions": len(coding_q),
+            "total_score": overall_score,
+            "max_total_score": overall_max,
+            "score_ratio": (overall_score / overall_max) if overall_max else 0,
+        },
+        "by_type": {
+            "theory": {
+                "score": sum((q.get("metrics") or {}).get("score") or 0 for q in theory_q),
+                "max_score": sum((q.get("metrics") or {}).get("max_score") or 0 for q in theory_q),
+                "score_ratio": (sum((q.get("metrics") or {}).get("score") or 0 for q in theory_q) / sum((q.get("metrics") or {}).get("max_score") or 0 for q in theory_q)) if theory_q and sum((q.get("metrics") or {}).get("max_score") or 0 for q in theory_q) else 0,
+            },
+            "coding": {
+                "score": sum((q.get("metrics") or {}).get("score_code") or 0 for q in coding_q),
+                "max_score": sum((q.get("metrics") or {}).get("max_score_code") or 0 for q in coding_q),
+                "score_ratio": (sum((q.get("metrics") or {}).get("score_code") or 0 for q in coding_q) / sum((q.get("metrics") or {}).get("max_score_code") or 0 for q in coding_q)) if coding_q and sum((q.get("metrics") or {}).get("max_score_code") or 0 for q in coding_q) else 0,
+                "avg_attempts": (sum((q.get("metrics") or {}).get("attempts") or 0 for q in coding_q) / len(coding_q)) if coding_q else 0,
+                "avg_hints_used": (sum((q.get("metrics") or {}).get("hints_used") or 0 for q in coding_q) / len(coding_q)) if coding_q else 0,
+            },
+        },
+    }
+    return {"metrics": metrics, "questions": questions}
+
+
+def build_full_session_summary(session_id: str) -> dict:
+    data = build_session_metrics(session_id)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (session_id,)))
+    anti_rows = fetchall_dicts(cur.execute("SELECT * FROM interview_events WHERE sessionId=?", (session_id,)))
+    anti = {"suspicious_events": len(anti_rows), "notes": "Подозрительных действий не зафиксировано" if not anti_rows else "Есть события анти-чит"}
+    data["session"] = {
+        "id": session_id,
+        "owner_id": session_row.get("ownerId") if session_row else None,
+        "track": session_row.get("direction") if session_row else None,
+        "level": session_row.get("level") if session_row else None,
+    }
+    data["anti_cheat"] = anti
+    conn.close()
+    return data
+
+
+SYSTEM_PROMPT_INTERVIEW_REPORT = """
+/no_think Ты — опытный технический тимлид и наставник.
+Твоя задача — по структурированным данным о собеседовании:
+
+- кратко описать общий уровень кандидата,
+- выделить сильные стороны,
+- честно, но аккуратно описать зоны роста,
+- дать рекомендации, куда двигаться дальше.
+
+Требования:
+- Пиши на русском языке.
+- Раздели отчёт на блоки с заголовками:
+  1) Итоговая оценка
+  2) Сильные стороны
+  3) Зоны роста
+  4) Рекомендации по развитию.
+- Не повторяй дословно тексты вопросов; пересказывай своими словами.
+- Используй данные о баллах, попытках, подсказках и покрытии key_points, чтобы делать выводы об уровне.
+- Отдельно отметь разницу между теорией и практикой (код).
+- Не придумывай факты, которых нет в данных (если чего-то не хватает, просто не упоминай это).
+"""
+
+
+def build_user_prompt_interview_report(session_summary: dict) -> str:
+    return f"""
+Ниже приведены структурированные данные о собеседовании в формате JSON.
+
+Данные:
+```json
+{json.dumps(session_summary, ensure_ascii=False)}
+```
+
+На основе этих данных:
+
+Сформируй подробный, но компактный отчёт о кандидате.
+
+Соблюдай структуру: 'Итоговая оценка', 'Сильные стороны', 'Зоны роста', 'Рекомендации по развитию'.
+
+Особое внимание:
+
+какие темы кандидат раскрывал хорошо (по key_points и score_ratio),
+
+где часто не хватало ключевых пунктов,
+
+как он справлялся с задачами по коду (сколько попыток, сколько подсказок).
+"""
+
+
+def generate_interview_reports_text(session_id: str) -> tuple[str, str]:
+    try:
+        summary = build_full_session_summary(session_id)
+        messages_candidate = [
+            {"role": "system", "content": SYSTEM_PROMPT_INTERVIEW_REPORT},
+            {"role": "user", "content": build_user_prompt_interview_report(summary)},
+        ]
+        resp_cand = chat_completion(
+            model="qwen3-32b-awq",
+            messages=messages_candidate,
+            temperature=0.4,
+            max_tokens=1500,
+        )
+        text_candidate = resp_cand.strip() if isinstance(resp_cand, str) else ""
+        system_admin = SYSTEM_PROMPT_INTERVIEW_REPORT + """
+Дополнительно:
+- Пиши чуть более формально.
+- Можешь упомянуть, подходит ли кандидат для middle-уровня, junior+ или senior-, исходя из данных.
+- Отдельно оцени риски: нестабильность знаний, слабые места, которые критичны для продакшн-разработки.
+"""
+        messages_admin = [
+            {"role": "system", "content": system_admin},
+            {"role": "user", "content": build_user_prompt_interview_report(summary)},
+        ]
+        resp_admin = chat_completion(
+            model="qwen3-32b-awq",
+            messages=messages_admin,
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        text_admin = resp_admin.strip() if isinstance(resp_admin, str) else ""
+        return text_candidate or "Отчёт не сформирован", text_admin or "Отчёт не сформирован"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("generate_interview_reports_text failed", extra={"error": str(exc)})
+        return "Отчёт не сформирован", "Отчёт не сформирован"
+
+
 @app.post("/api/code/hint")
 def code_hint(payload: CodeHintPayload):
     conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
@@ -519,6 +832,10 @@ def generate_unique_code_task(cur, session_id: str, track: str, level: str, cate
         if not _is_duplicate_code_task(cur, session_id, track, category, task):
             return task
     return last_task or {}
+
+
+def _session_task_id(base_id: Optional[str], session_id: str) -> str:
+    return f"{base_id or 'code'}-{session_id}" if session_id else (base_id or f"code-{uuid.uuid4()}")
 
 
 def fetchall_dicts(cursor):
@@ -744,13 +1061,14 @@ def start_interview(payload: StartPayload):
     function_signature = None
     function_signature = None
     q_obj: dict = {}
+    session_id = str(uuid.uuid4())
 
     # Пробуем сгенерировать coding-задачу, если выбрана и не в дуальном режиме (в дуальном теорию выдаём первой)
     code_task_id = None
     if "coding" in task_types and not dual_mode:
         try:
             q_obj = generate_unique_code_task(cur, "", (payload.direction or "fullstack").lower(), (payload.level or "middle").lower(), "algo", "python")
-            code_task_id = q_obj.get("task_id") or f"code-{uuid.uuid4()}"
+            code_task_id = _session_task_id(q_obj.get("task_id"), session_id)
             public_tests, hidden_tests = build_tests_for_task(q_obj)
             save_code_task_and_tests(cur, code_task_id, q_obj, public_tests, hidden_tests)
             question_id = f"llm-code-{uuid.uuid4()}"
@@ -790,7 +1108,6 @@ def start_interview(payload: StartPayload):
         raise HTTPException(status_code=404, detail="no_questions")
 
     total_questions = 10 if dual_mode else 1
-    session_id = str(uuid.uuid4())
     started_at = now_iso()
     if question_type == "theory":
         starter = ""
@@ -1059,9 +1376,29 @@ def check(session_id: str):
 
 
 @app.get("/api/report/{report_id}")
-def report(report_id: str):
+def report(report_id: str, download: Optional[int] = 0):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    # Пытаемся найти новый отчёт
+    rep = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE id=? OR sessionId=?", (report_id, report_id)))
+    if rep:
+        conn.close()
+        if download:
+            return PlainTextResponse(rep.get("summary_candidate") or "Отчёт отсутствует", headers={"Content-Disposition": f"attachment; filename=report-{rep.get('sessionId')}.txt"})
+        return {
+            "report": {
+                "id": rep.get("id"),
+                "sessionId": rep.get("sessionId"),
+                "ownerId": rep.get("ownerId"),
+                "track": rep.get("track"),
+                "level": rep.get("level"),
+                "metrics": json.loads(rep.get("metrics_json") or "{}"),
+                "questions": json.loads(rep.get("questions_json") or "[]"),
+                "summary_candidate": rep.get("summary_candidate"),
+                "summary_admin": rep.get("summary_admin"),
+                "recommendations": json.loads(rep.get("recommendations_json") or "{}"),
+            }
+        }
     cur.execute("SELECT * FROM reports WHERE id=?", (report_id,))
     row = fetchone_dict(cur)
     conn.close()
@@ -1610,12 +1947,13 @@ def code_check(payload: CheckCodePayload):
                 category = choose_next_category(cur, payload.sessionId, track)
                 if category:
                     next_q_obj = generate_unique_code_task(cur, payload.sessionId, track, level, category, lang)
-                    next_code_task_id = next_q_obj.get("task_id") or f"code-{uuid.uuid4()}"
+                    next_code_task_id = _session_task_id(next_q_obj.get("task_id"), payload.sessionId)
                     public_tests2, hidden_tests2 = build_tests_for_task(next_q_obj)
                     save_code_task_and_tests(cur, next_code_task_id, next_q_obj, public_tests2, hidden_tests2)
                     next_question_id = f"llm-code-{uuid.uuid4()}"
                     pos = cur.execute("SELECT COUNT(*) FROM session_questions WHERE sessionId=?", (payload.sessionId,)).fetchone()[0] + 1
                     starter_next = sanitize_starter_code(next_q_obj)
+                    next_title = next_q_obj.get("title") or f"Вопрос {pos}"
                     meta_json = json.dumps({**next_q_obj, "task_id": next_code_task_id, "starter_code": starter_next}, ensure_ascii=False)
                     # Обновляем сессию на новый текущий вопрос
                     cur.execute(
@@ -1626,7 +1964,7 @@ def code_check(payload: CheckCodePayload):
                         """,
                         (
                             next_question_id,
-                            next_q_obj.get("title") or f"Вопрос {pos}",
+                            next_title,
                             next_q_obj.get("description_markdown"),
                             starter_next,
                             payload.sessionId,
@@ -1640,7 +1978,7 @@ def code_check(payload: CheckCodePayload):
                         (
                             payload.sessionId,
                             next_question_id,
-                            next_q_obj.get("title") or f"Вопрос {pos}",
+                            next_title,
                             pos,
                             meta_json,
                             "coding",
@@ -1650,7 +1988,7 @@ def code_check(payload: CheckCodePayload):
                     )
                     next_question = {
                         "id": next_question_id,
-                        "title": next_q_obj.get("title"),
+                        "title": next_title,
                         "description": next_q_obj.get("description_markdown"),
                         "starterCode": starter_next,
                         "functionSignature": next_q_obj.get("function_signature"),
@@ -1840,7 +2178,7 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
     if "coding" in task_types:
         try:
             q_obj = generate_unique_code_task(cur, assigned.get("sessionId") or session_id, (assigned.get("direction") or "fullstack").lower(), (assigned.get("level") or "middle").lower(), "algo", "python")
-            code_task_id = q_obj.get("task_id") or f"code-{uuid.uuid4()}"
+            code_task_id = _session_task_id(q_obj.get("task_id"), assigned.get("sessionId") or session_id)
             public_tests, hidden_tests = build_tests_for_task(q_obj)
             save_code_task_and_tests(cur, code_task_id, q_obj, public_tests, hidden_tests)
             question_id = f"llm-code-{uuid.uuid4()}"
@@ -2495,6 +2833,8 @@ def finish_interview(payload: FinishInterviewPayload):
                     "UPDATE assigned_interviews SET status='completed', sessionId=? WHERE id=?",
                     (payload.sessionId, session.get("assignedId")),
                 )
+            # Генерируем отчёт
+            # Генерация отчёта отключена, пока сохраняем только итоговый score
             return {"status": "ok", "score": total_score}
         except sqlite3.OperationalError as exc:  # noqa: BLE001
             last_err = exc

@@ -260,6 +260,24 @@ def ensure_schema():
         cur.execute("ALTER TABLE interview_results ADD COLUMN finishedAt TEXT DEFAULT CURRENT_TIMESTAMP")
     if "score" not in ir_cols:
         cur.execute("ALTER TABLE interview_results ADD COLUMN score INTEGER")
+    # Итоговые отчёты
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interview_reports (
+          id TEXT PRIMARY KEY,
+          sessionId TEXT NOT NULL,
+          ownerId TEXT NOT NULL,
+          track TEXT,
+          level TEXT,
+          metrics_json TEXT,
+          questions_json TEXT,
+          summary_candidate TEXT,
+          summary_admin TEXT,
+          recommendations_json TEXT,
+          createdAt TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS answers (

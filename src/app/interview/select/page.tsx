@@ -12,7 +12,7 @@ import { AssignedInterview } from "@/types";
 
 const directions = ["Frontend", "Backend", "DS", "ML", "DevOps", "Fullstack"];
 const difficulties = ["Junior", "Middle", "Senior"] as const;
-const taskTypes = ["Coding", "Algorithms", "Debug", "Theory"];
+const taskTypes = ["Coding", "Theory"];
 
 type Level = (typeof difficulties)[number];
 
@@ -77,6 +77,7 @@ export default function SelectPage() {
   }, [user, setSession, setInterviewId, router, reset]);
 
   const handleStart = async () => {
+    if (mutation.isPending) return;
     try {
       const active = await api.getActiveInterview();
       if (active?.id) {
@@ -89,7 +90,16 @@ export default function SelectPage() {
       // ignore, пойдём дальше
     }
     reset();
-    mutation.mutate();
+    try {
+      const session = await mutation.mutateAsync();
+      if (session?.id) {
+        setSession(session);
+        setInterviewId(session.id);
+        router.push(`/interview/session/${session.id}`);
+      }
+    } catch (e) {
+      console.warn("start interview failed", e);
+    }
   };
 
   return (

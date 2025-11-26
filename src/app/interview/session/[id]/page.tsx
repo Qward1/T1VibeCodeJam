@@ -11,7 +11,7 @@ import { Card } from "@/components/UI/Card";
 import { TestResults } from "@/components/Interview/TestResults";
 import { useRouter } from "next/navigation";
 import { TextArea } from "@/components/UI/TextArea";
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/stores/auth";
 
@@ -152,7 +152,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         questionId: current.questionId,
         taskId: current.codeTaskId,
         code,
-        language: selectedLanguage || current.language || "python",
+        language: current.language || "python",
         ownerId: user?.id,
       });
     },
@@ -169,7 +169,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const [codeByQuestion, setCodeByQuestion] = useState<Record<string, string>>(() => {
     if (typeof window === "undefined") return {};
     try {
-      const raw = localStorage.getItem("vibe-code-by-question");
+      const raw = localStorage.getItem(storageKey);
       return raw ? (JSON.parse(raw) as Record<string, string>) : {};
     } catch {
       return {};
@@ -230,7 +230,9 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const [attemptsByQuestion, setAttemptsByQuestion] = useState<Record<string, number>>({});
   const [finishConfirm, setFinishConfirm] = useState(false);
   const [scoreModal, setScoreModal] = useState<{ open: boolean; score: number | null }>({ open: false, score: null });
+  const [finishing, setFinishing] = useState(false);
   const current = storedSession ?? session ?? null;
+  const storageKey = useMemo(() => `vibe-code-by-question:${current?.id || "global"}`, [current?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 const currentIndex =
     current && current.usedQuestions
       ? Math.max(
@@ -255,6 +257,56 @@ const currentIndex =
       setSelectedLanguage(current.language);
     }
   }, [current?.language]);
+
+  const applyNextQuestion = useCallback(
+    (next: any) => {
+      const merged = { ...next, startedAt: next.startedAt ?? current?.startedAt, timer: next.timer ?? current?.timer };
+      setSession((prev) => {
+        const base = { ...(merged || prev || {}) };
+        const prevUsed = base.usedQuestions ?? prev?.usedQuestions ?? [];
+        const exists = base.questionId ? prevUsed.find((q) => q.id === base.questionId) : undefined;
+        const updatedUsed =
+          exists || !base.questionId
+            ? prevUsed
+            : [...prevUsed, { id: base.questionId, title: base.questionTitle, qType: base.useIDE ? "coding" : "theory", codeTaskId: base.codeTaskId, position: prevUsed.length }];
+        return { ...base, usedQuestions: updatedUsed, total: base.total ?? updatedUsed.length };
+      });
+      setInterviewId(merged.id);
+      if (merged.questionId && answersState[merged.questionId] !== undefined) {
+        setAnswer(answersState[merged.questionId]);
+      } else {
+        setAnswer("");
+      }
+      if (merged.useIDE) {
+        const cached = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
+        setCodeByQuestion((prev) => {
+          const updated = { ...prev };
+          if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
+            updated[merged.questionId] = merged.starterCode;
+          }
+          if (typeof window !== "undefined") {
+            try {
+              localStorage.setItem(storageKey, JSON.stringify(updated));
+            } catch {
+              // ignore
+            }
+          }
+          return updated;
+        });
+        setCode(cached);
+      } else {
+        setCode("");
+      }
+      setFollowUpQuestion(null);
+      setFollowUpAnswer("");
+      setMissingPoints([]);
+      setBaseScore(null);
+      setFollowStatus("idle");
+      setAnswerStatus("idle");
+      setFollowLocked(false);
+    },
+    [answersState, codeByQuestion, current?.startedAt, current?.timer, setSession, setInterviewId, storageKey]
+  );
 
   useEffect(() => {
     const load = async () => {
@@ -298,46 +350,7 @@ const currentIndex =
     if (!current?.id) return;
     try {
       const next = await api.nextQuestion(current.id);
-      const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
-      // Обновляем usedQuestions локально, если бэкенд не прислал новый список
-      setSession((prev) => {
-        const base = { ...(merged || prev || {}) };
-        const prevUsed = base.usedQuestions ?? prev?.usedQuestions ?? [];
-        const exists = base.questionId ? prevUsed.find((q) => q.id === base.questionId) : undefined;
-        const updatedUsed = exists || !base.questionId ? prevUsed : [...prevUsed, { id: base.questionId, title: base.questionTitle, qType: base.useIDE ? "coding" : "theory", codeTaskId: base.codeTaskId, position: prevUsed.length }];
-        return { ...base, usedQuestions: updatedUsed, total: base.total ?? updatedUsed.length };
-      });
-      setInterviewId(merged.id);
-      if (merged.questionId && answersState[merged.questionId] !== undefined) {
-        setAnswer(answersState[merged.questionId]);
-      } else {
-        setAnswer("");
-      }
-      if (merged.useIDE) {
-        const cached = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
-        setCodeByQuestion((prev) => {
-          const updated = { ...prev };
-          if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
-            updated[merged.questionId] = merged.starterCode;
-          }
-          if (typeof window !== "undefined") {
-            try {
-              localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
-            } catch {
-              // ignore
-            }
-          }
-          return updated;
-        });
-        setCode(cached);
-      }
-      setFollowUpQuestion(null);
-      setFollowUpAnswer("");
-      setMissingPoints([]);
-      setBaseScore(null);
-      setFollowStatus("idle");
-      setAnswerStatus("idle");
-      setFollowLocked(false);
+      applyNextQuestion(next);
     } catch (e) {
       console.warn("nextQuestion failed", e);
     }
@@ -605,7 +618,8 @@ const currentIndex =
                       setFollowUpAnswer("");
                     } else {
                       setFollowLocked(true);
-                      await loadNextQuestion();
+                      const next = await api.nextQuestion(current.id);
+                      applyNextQuestion(next);
                     }
                   setAnswerStatus("saved");
                   setTimeout(() => setAnswerStatus("idle"), 1500);
@@ -667,7 +681,8 @@ const currentIndex =
                         setFollowUpAnswer("");
                         setMissingPoints([]);
                         setFollowLocked(true);
-                        await loadNextQuestion();
+                        const next = await api.nextQuestion(current.id);
+                        applyNextQuestion(next);
                         setFollowStatus("saved");
                         setTimeout(() => setFollowStatus("idle"), 1500);
                       } catch (e) {
@@ -675,7 +690,7 @@ const currentIndex =
                       }
                     }}
                     size="md"
-                    className="w-full bg-vibe-100 text-vibe-700"
+                    className="w-1/3 min-w-[160px] bg-vibe-100 text-vibe-700"
                   >
                     {followStatus === "saving" ? "Оцениваем..." : "Отправить ответ"}
                   </Button>
@@ -712,7 +727,7 @@ const currentIndex =
                     setCodeByQuestion(updated);
                     if (typeof window !== "undefined") {
                       try {
-                        localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
+                        localStorage.setItem(storageKey, JSON.stringify(updated));
                       } catch {
                         // ignore
                       }
@@ -819,18 +834,47 @@ const currentIndex =
             </Button>
             <Button
               className="bg-rose-500 text-white hover:bg-rose-600"
+              disabled={finishing}
               onClick={async () => {
                 if (!current?.id) return;
-                const sc = await api.finishInterview(current.id);
-                queryClient.setQueryData(["admin-events"], []);
-                reset();
-                setFinishConfirm(false);
-                setScoreModal({ open: true, score: sc ?? null });
+                setFinishing(true);
+                try {
+                  const sc = await api.finishInterview(current.id);
+                  queryClient.setQueryData(["admin-events"], []);
+                  reset();
+                  setFinishConfirm(false);
+                  setScoreModal({ open: true, score: sc ?? null });
+                } catch (e) {
+                  console.warn("finish interview failed", e);
+                  setFinishConfirm(false);
+                  router.push("/profile");
+                } finally {
+                  setFinishing(false);
+                }
               }}
             >
-              Да
+              {finishing ? "Завершаем..." : "Да"}
             </Button>
           </div>
+        </div>
+      </div>
+    )}
+    {scoreModal.open && (
+      <div className="fixed inset-0 z-[3500] flex items-center justify-center bg-black/40 p-4">
+        <div className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--card)] p-6 text-center shadow-2xl">
+          <div className="text-lg font-semibold mb-3">Собеседование завершено</div>
+          <div className="text-sm text-[var(--muted)] mb-2">Итоговый score</div>
+          <div className="text-4xl font-bold text-vibe-600 mb-4">{scoreModal.score ?? "—"}</div>
+          <p className="text-sm text-[var(--muted)] mb-5">Спасибо за прохождение! Вы можете посмотреть отчёт в профиле.</p>
+          <Button
+            className="w-full bg-vibe-600 text-white hover:bg-vibe-700"
+            onClick={() => {
+              setScoreModal({ open: false, score: null });
+              router.push("/profile");
+            }}
+          >
+            Перейти в профиль
+          </Button>
         </div>
       </div>
     )}
@@ -902,28 +946,6 @@ const currentIndex =
               }}
             >
               Отправить
-            </Button>
-          </div>
-        </div>
-      </div>
-    )}
-    {scoreModal.open && (
-      <div className="fixed inset-0 z-[3500] flex items-center justify-center bg-black/40 p-4">
-        <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-2xl text-center">
-          <div className="text-lg font-semibold mb-2">Итоговый Score</div>
-          <div className="text-3xl font-bold text-vibe-600 mb-3">
-            {scoreModal.score !== null ? scoreModal.score : "—"}
-          </div>
-          <p className="text-sm text-[var(--muted)] mb-4">Спасибо за прохождение собеседования!</p>
-          <div className="flex justify-center gap-2">
-            <Button
-              className="bg-vibe-600 text-white hover:bg-vibe-700"
-              onClick={() => {
-                setScoreModal({ open: false, score: null });
-                router.push("/profile");
-              }}
-            >
-              Закрыть
             </Button>
           </div>
         </div>

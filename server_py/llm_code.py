@@ -288,20 +288,21 @@ def generate_code_task(
 
         def _loads_safe(snippet: str):
             cleaned = re.sub(r",(\s*[}\]])", r"\1", snippet)  # убираем висячие запятые
-            try:
-                return json.loads(cleaned)
-            except Exception:
-                pass
-            # Расширенный парсер: переводим JSON-подобную строку в python-литерал
-            try:
-                py_like = (
-                    cleaned.replace("null", "None")
-                    .replace("true", "True")
-                    .replace("false", "False")
-                )
-                return ast.literal_eval(py_like)
-            except Exception as exc:
-                raise ValueError("cannot_parse_llm_json") from exc
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+        # Расширенный парсер: переводим JSON-подобную строку в python-литерал
+        try:
+            py_like = (
+                cleaned.replace("null", "None")
+                .replace("true", "True")
+                .replace("false", "False")
+            )
+            return ast.literal_eval(py_like)
+        except Exception:
+            # Если не смогли корректно распарсить – вернём None, чтобы сработал fallback
+            return None
 
         try:
             return extract_json(text)
@@ -309,11 +310,15 @@ def generate_code_task(
             pass
         m = re.search(r"\{.*\}", text, re.S)
         if m:
-            return _loads_safe(m.group(0))
+            parsed = _loads_safe(m.group(0))
+            if parsed:
+                return parsed
         if "{" in text and "}" in text:
             first, last = text.find("{"), text.rfind("}")
-            return _loads_safe(text[first : last + 1])
-        raise ValueError("cannot_parse_llm_json")
+            parsed = _loads_safe(text[first : last + 1])
+            if parsed:
+                return parsed
+        return None
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_GENERATE_CODE_TASK},
@@ -336,7 +341,8 @@ def generate_code_task(
             raise ValueError("empty_llm_response")
         data = _parse_llm_json(raw)
         if not data:
-            raise ValueError("cannot_parse_llm_json")
+            logger.warning("LLM code task parse attempt failed, using fallback", extra={"track": track, "level": level, "category": category})
+            return _fallback_code_task(track, level, category, language)
         logger.info("LLM code task parsed", extra={"task_id": data.get("task_id"), "title": data.get("title")})
         return data
     except Exception as exc:  # noqa: BLE001

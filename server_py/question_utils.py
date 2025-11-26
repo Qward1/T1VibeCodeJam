@@ -134,6 +134,8 @@ def collect_previous_code_topics(cur, session_id: str, track: str):
 
 def save_code_task_and_tests(cur, task_id: str, task: dict, public_tests: List[dict], hidden_tests: List[dict]):
     """Сохраняет кодовую задачу и тесты в БД."""
+    # очищаем старые тесты для этого task_id, чтобы не смешивались с прошлых сессий
+    cur.execute("DELETE FROM code_tests WHERE task_id=?", (task_id,))
     cur.execute(
         """
         INSERT OR REPLACE INTO code_tasks (task_id, track, level, category, language, allowed_languages_json, title, description_markdown, function_signature, starter_code, constraints_json, reference_solution, topic, raw_json)
