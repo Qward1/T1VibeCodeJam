@@ -110,6 +110,7 @@ class ChangeLanguagePayload(BaseModel):
 class FinishInterviewPayload(BaseModel):
     sessionId: str
     ownerId: str
+    generateReport: bool | None = True
 
 class AnswerPayload(BaseModel):
     sessionId: str
@@ -3582,6 +3583,8 @@ def finish_interview(payload: FinishInterviewPayload):
                     "UPDATE assigned_interviews SET status='completed', sessionId=? WHERE id=?",
                     (payload.sessionId, session.get("assignedId")),
                 )
+            if payload.generateReport is False:
+                return {"status": "ok", "score": total_score, "report_id": None}
             try:
                 report_id = generate_interview_report(payload.sessionId, payload.ownerId or "", conn)
                 return {"status": "ok", "score": total_score, "report_id": report_id}

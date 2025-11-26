@@ -22,12 +22,15 @@ def _healthy_db(path: Path) -> bool:
 
 
 def _force_disable_wal(path: Path):
+    if not path.exists():
+        return
     try:
         conn = sqlite3.connect(path)
         conn.execute("PRAGMA journal_mode=DELETE;")
         conn.close()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to disable WAL", extra={"error": str(exc), "path": str(path)})
+    except Exception:
+        # Игнорируем сбои при смене journal_mode, чтобы не шуметь в логах
+        pass
 
 
 # Если основной файл бьётся об I/O (часто на DrvFS из-за WAL), пробуем безопасно

@@ -89,6 +89,10 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         : passed
           ? "Все тесты пройдены"
           : "Часть тестов не пройдена";
+      if (current?.questionId) {
+        setCheckResultsByQuestion((prev) => ({ ...prev, [current.questionId!]: { passed, summary, cases } }));
+        setLastTestKindByQuestion((prev) => ({ ...prev, [current.questionId!]: "check" }));
+      }
       setTestResult({ passed, summary, cases });
       setLastTestKind("check");
       const now = Date.now();
@@ -128,6 +132,10 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     },
     onSuccess: (res) => {
       setRunResult(res);
+      if (current?.questionId) {
+        setRunResultsByQuestion((prev) => ({ ...prev, [current.questionId!]: res }));
+        setLastTestKindByQuestion((prev) => ({ ...prev, [current.questionId!]: "run" }));
+      }
       setLastTestKind("run");
       if (res?.hasError) {
         queryClient.invalidateQueries({ queryKey: ["chat", current?.id, current?.questionId] });
@@ -166,6 +174,11 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     tests?: { name: string; status: string; expected: any; actual: any }[];
     hasError?: boolean;
   } | null>(null);
+  const [checkResultsByQuestion, setCheckResultsByQuestion] = useState<
+    Record<string, { passed: boolean; summary: string; cases: any[] }>
+  >({});
+  const [runResultsByQuestion, setRunResultsByQuestion] = useState<Record<string, any>>({});
+  const [lastTestKindByQuestion, setLastTestKindByQuestion] = useState<Record<string, "check" | "run">>({});
   const hintMutation = useMutation({
     mutationFn: async () => {
       if (!current?.id || !current?.questionId || !current?.codeTaskId || !user?.id) throw new Error("missing_params");
@@ -191,6 +204,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const [finishConfirm, setFinishConfirm] = useState(false);
   const [scoreModal, setScoreModal] = useState<{ open: boolean; score: number | null }>({ open: false, score: null });
   const [finishing, setFinishing] = useState(false);
+  const [generateReport, setGenerateReport] = useState(true);
   const storageKey = useMemo(() => `vibe-code-by-question:${current?.id || "global"}`, [current?.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const [codeByQuestion, setCodeByQuestion] = useState<Record<string, string>>(() => {
     if (typeof window === "undefined") return {};
@@ -499,6 +513,14 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     };
   }, [supportOpen, user?.id]);
 
+  const activeLastKind = current?.questionId
+    ? lastTestKindByQuestion[current.questionId] ?? lastTestKind
+    : lastTestKind;
+  const activeCheckResult = current?.questionId
+    ? checkResultsByQuestion[current.questionId] ?? null
+    : testResult;
+  const activeRunResult = current?.questionId ? runResultsByQuestion[current.questionId] ?? null : runResult;
+
   if (!current) return <div>Загрузка сессии...</div>;
 
   return (
@@ -768,18 +790,18 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                   {mutation.isPending ? "Проверяем..." : "Проверить решение"}
                 </Button>
               </div>
-              {lastTestKind === "check" && <TestResults result={testResult} />}
-              {lastTestKind === "run" && runResult && (
+              {activeLastKind === "check" && activeCheckResult && <TestResults result={activeCheckResult} />}
+              {activeLastKind === "run" && activeRunResult && (
                 <div className="mt-3 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-3">
                   <div className="mb-2 font-semibold">Результаты примеров</div>
-                  {runResult.hasError && (
+                  {activeRunResult.hasError && (
                     <div className="text-sm text-rose-500">
-                      Ошибка выполнения кода{runResult.error ? `: ${runResult.error}` : ""}
+                      Ошибка выполнения кода{activeRunResult.error ? `: ${activeRunResult.error}` : ""}
                     </div>
                   )}
-                  {!runResult.hasError && (
+                  {!activeRunResult.hasError && (
                     <div className="space-y-2 text-sm">
-                      {(runResult.tests || []).map((t) => (
+                      {(activeRunResult.tests || []).map((t: any) => (
                         <div key={t.name} className="rounded-xl border border-[var(--border)] px-3 py-2">
                           <div className="flex items-center justify-between">
                             <span className="font-medium">{t.name}</span>
@@ -799,7 +821,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
               )}
             </Card>
           )}
-          {!current.useIDE && lastTestKind === "check" && <TestResults result={testResult} />}
+          {!current.useIDE && activeLastKind === "check" && activeCheckResult && <TestResults result={activeCheckResult} />}
         </div>
         {current.useIDE && (
           <div
@@ -826,6 +848,25 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         <div className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-2xl">
           <div className="mb-3 text-lg font-semibold">Вы точно хотите завершить?</div>
           <p className="text-sm text-[var(--muted)] mb-4">Все несохранённые ответы будут потеряны.</p>
+          <div className="mb-4 space-y-2">
+            <div className="text-sm font-medium">Сгенерировать отчет?</div>
+            <div className="flex gap-2">
+              <Button
+                variant={generateReport ? "default" : "outline"}
+                onClick={() => setGenerateReport(true)}
+                className={generateReport ? "" : "border-[var(--border)]"}
+              >
+                Да
+              </Button>
+              <Button
+                variant={!generateReport ? "default" : "outline"}
+                onClick={() => setGenerateReport(false)}
+                className={!generateReport ? "" : "border-[var(--border)]"}
+              >
+                Нет
+              </Button>
+            </div>
+          </div>
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={() => setFinishConfirm(false)}>
               Нет
@@ -837,7 +878,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                 if (!current?.id) return;
                 setFinishing(true);
                 try {
-                  const sc = await api.finishInterview(current.id);
+                  const sc = await api.finishInterview(current.id, generateReport);
                   queryClient.setQueryData(["admin-events"], []);
                   reset();
                   setFinishConfirm(false);

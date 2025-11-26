@@ -496,21 +496,21 @@ export const api = {
     });
   },
 
-  async finishInterview(sessionId: string): Promise<number | null> {
+  async finishInterview(sessionId: string, generateReport = true): Promise<number | null> {
     if (useBackend && API_BASE) {
       try {
         if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
         try {
           const res = await call<{ status: string; score?: number }>(`/api/session/finish`, {
             method: "POST",
-            body: JSON.stringify({ sessionId, ownerId: activeUser.id }),
+            body: JSON.stringify({ sessionId, ownerId: activeUser.id, generateReport }),
           });
           return res?.score ?? null;
         } catch {
           // Совместимость со старым роутом, если вдруг нужен
           const res2 = await call<{ status: string; score?: number }>(`/api/interview/finish`, {
             method: "POST",
-            body: JSON.stringify({ sessionId, ownerId: activeUser.id }),
+            body: JSON.stringify({ sessionId, ownerId: activeUser.id, generateReport }),
           });
           return res2?.score ?? null;
         }
