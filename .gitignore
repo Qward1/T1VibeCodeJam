@@ -23,6 +23,7 @@ Thumbs.db
 
 # Python venv/bytecode
 .venv
+venv
 __pycache__
 *.pyc
 

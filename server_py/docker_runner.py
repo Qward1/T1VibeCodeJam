@@ -115,11 +115,24 @@ def run_code_with_fallback(language: str, code: str, function_name: str, tests: 
     """
     Сначала пробуем Docker. Если Docker недоступен и язык python — пробуем локальный раннер.
     """
+    result = {}
     try:
-        return run_code_in_docker(language, code, function_name, tests, timeout=timeout)
+        result = run_code_in_docker(language, code, function_name, tests, timeout=timeout)
     except Exception as exc:
         msg = str(exc).lower()
         docker_down = "docker" in msg and ("pipe" in msg or "daemon" in msg or "connect" in msg)
         if allow_local and docker_down and language.lower() in ("python", "py"):
-            return _run_code_locally_python(code, function_name, tests, timeout=timeout)
-        raise
+            result = _run_code_locally_python(code, function_name, tests, timeout=timeout)
+        else:
+            raise
+    try:
+        rtests = result.get("tests", [])
+        for idx, orig in enumerate(tests):
+            if idx < len(rtests):
+                rtests[idx]["input"] = rtests[idx].get("input", orig.get("input"))
+                if "expected" not in rtests[idx]:
+                    rtests[idx]["expected"] = orig.get("expected")
+        result["tests"] = rtests
+    except Exception:
+        pass
+    return result

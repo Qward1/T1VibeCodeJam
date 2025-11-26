@@ -199,6 +199,31 @@ SYSTEM_PROMPT_GENERATE_CODE_TASK = """
 """
 
 
+SYSTEM_PROMPT_GENERATE_CODE_TASK_STRICT = """
+/no_think верни ОДНУ задачу на код в формате валидного JSON одним блоком.
+Никакого Markdown, никакого текста до или после, только JSON-объект.
+Структура ровно как в примере:
+{
+  "task_id": "...",
+  "title": "...",
+  "description_markdown": "...",
+  "track": "...",
+  "level": "...",
+  "category": "...",
+  "language": "...",
+  "allowed_languages": ["python", "javascript"],
+  "function_signature": "...",
+  "starter_code": "...",
+  "constraints": ["..."],
+  "reference_solution": "...",
+  "sample_inputs": [{"name": "...", "input": [ ... ]}],
+  "edge_case_inputs": [{"name": "...", "input": [ ... ]}],
+  "topic": "..."
+}
+Никаких комментариев, никаких ```json, только чистый JSON.
+"""
+
+
 def build_user_prompt_generate_code_task(
     track: str,
     level: str,
@@ -288,21 +313,20 @@ def generate_code_task(
 
         def _loads_safe(snippet: str):
             cleaned = re.sub(r",(\s*[}\]])", r"\1", snippet)  # убираем висячие запятые
-        try:
-            return json.loads(cleaned)
-        except Exception:
-            pass
-        # Расширенный парсер: переводим JSON-подобную строку в python-литерал
-        try:
-            py_like = (
-                cleaned.replace("null", "None")
-                .replace("true", "True")
-                .replace("false", "False")
-            )
-            return ast.literal_eval(py_like)
-        except Exception:
-            # Если не смогли корректно распарсить – вернём None, чтобы сработал fallback
-            return None
+            try:
+                return json.loads(cleaned)
+            except Exception:
+                pass
+            # Расширенный парсер: переводим JSON-подобную строку в python-литерал
+            try:
+                py_like = (
+                    cleaned.replace("null", "None")
+                    .replace("true", "True")
+                    .replace("false", "False")
+                )
+                return ast.literal_eval(py_like)
+            except Exception:
+                return None
 
         try:
             return extract_json(text)
@@ -329,25 +353,81 @@ def generate_code_task(
             ),
         },
     ]
-    try:
-        raw = chat_completion(
-            model="qwen3-32b-awq",
-            messages=messages,
-            temperature=0.3,
-            max_tokens=900,
-        )
-        logger.info("LLM code task raw response", extra={"track": track, "level": level, "category": category})
+    fallback_json = json.dumps(_fallback_code_task(track, level, category, language), ensure_ascii=False)
+
+    attempts = [
+        {"messages": messages, "temperature": 0.3, "label": "main"},
+        {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT_GENERATE_CODE_TASK_STRICT},
+                {
+                    "role": "user",
+                    "content": build_user_prompt_generate_code_task(
+                        track, level, category, language, previous_algo_topics, previous_domain_topics
+                    ),
+                },
+            ],
+            "temperature": 0.0,
+            "label": "strict_retry",
+        },
+        {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT_GENERATE_CODE_TASK_STRICT},
+                {
+                    "role": "user",
+                    "content": build_user_prompt_generate_code_task(
+                        track, level, category, language, previous_algo_topics, previous_domain_topics
+                    ),
+                },
+            ],
+            "temperature": 0.0,
+            "label": "strict_retry_2",
+        },
+    ]
+
+    for idx, cfg in enumerate(attempts, start=1):
+        try:
+            raw = chat_completion(
+                model="qwen3-32b-awq",
+                messages=cfg["messages"],
+                temperature=cfg["temperature"],
+                max_tokens=900,
+                response_format={"type": "json_object"},
+                fallback_json=fallback_json,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "LLM code task request failed",
+                extra={"track": track, "level": level, "category": category, "attempt": idx, "error": str(exc)},
+            )
+            continue
+
         if not raw or not isinstance(raw, str):
-            raise ValueError("empty_llm_response")
+            logger.warning(
+                "LLM code task empty response",
+                extra={"track": track, "level": level, "category": category, "attempt": idx},
+            )
+            continue
+
         data = _parse_llm_json(raw)
-        if not data:
-            logger.warning("LLM code task parse attempt failed, using fallback", extra={"track": track, "level": level, "category": category})
-            return _fallback_code_task(track, level, category, language)
-        logger.info("LLM code task parsed", extra={"task_id": data.get("task_id"), "title": data.get("title")})
-        return data
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("LLM code task generation failed, using fallback", extra={"track": track, "level": level, "category": category, "error": str(exc)})
-        return _fallback_code_task(track, level, category, language)
+        if data:
+            logger.info(
+                "LLM code task parsed",
+                extra={"task_id": data.get("task_id"), "title": data.get("title"), "attempt": idx},
+            )
+            return data
+
+        raw_sample = raw[:400] if isinstance(raw, str) else str(raw)
+        logger.warning(
+            "LLM code task parse attempt failed",
+            extra={"track": track, "level": level, "category": category, "attempt": idx, "raw_sample": raw_sample},
+        )
+
+    logger.warning(
+        "LLM code task parse attempt failed after retries, using fallback",
+        extra={"track": track, "level": level, "category": category},
+    )
+    return _fallback_code_task(track, level, category, language)
 
 
 def explain_code_error(language: str, function_signature: str, user_code: str, error_text: str) -> Optional[str]:

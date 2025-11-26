@@ -78,7 +78,7 @@ export type Message = {
 export type TestResult = {
   passed: boolean;
   summary: string;
-  cases: { name: string; passed: boolean; details?: string }[];
+  cases: { name: string; passed: boolean; details?: string; input?: any; expected?: any; actual?: any }[];
 };
 
 export type InterviewReport = {

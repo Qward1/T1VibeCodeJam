@@ -70,7 +70,10 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       const cases = (result?.publicTests || []).map((t: any) => ({
         name: t.name,
         passed: t.status === "passed",
-        details: t.status === "failed" ? `ожидалось ${JSON.stringify(t.expected)}, получено ${JSON.stringify(t.actual)}` : undefined,
+        input: t.input,
+        expected: t.expected,
+        actual: t.actual,
+        details: t.status === "failed" ? `????????? ${JSON.stringify(t.expected)}, ???????? ${JSON.stringify(t.actual)}` : undefined,
       }));
       const summary = result?.hasError
         ? "Ошибка выполнения кода"
@@ -91,6 +94,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       lastTestAt.current = now;
       // Если бэкенд вернул новый вопрос — добавляем кнопку
       if (result?.finished && result?.nextQuestion) {
+        setLoadingNext(true);
         const nextQ = result.nextQuestion;
         setSession((prev) => {
           if (!prev) return prev;
@@ -111,6 +115,9 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
             starterCode: nextQ.starterCode ?? prev.starterCode,
           };
         });
+        setTestResult(undefined);
+        setRunResult(null);
+        setLastTestKind(null);
         const starter = nextQ.starterCode as string | undefined;
         setCodeByQuestion((prev) => {
           const updated = { ...prev };
@@ -141,6 +148,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         setMissingPoints([]);
         setBaseScore(null);
         setFollowLocked(false);
+        setLoadingNext(false);
       }
     },
   });
@@ -258,8 +266,11 @@ const currentIndex =
     }
   }, [current?.language]);
 
+  const [loadingNext, setLoadingNext] = useState(false);
+
   const applyNextQuestion = useCallback(
     (next: any) => {
+      setLoadingNext(true);
       const merged = { ...next, startedAt: next.startedAt ?? current?.startedAt, timer: next.timer ?? current?.timer };
       setSession((prev) => {
         const base = { ...(merged || prev || {}) };
@@ -304,6 +315,7 @@ const currentIndex =
       setFollowStatus("idle");
       setAnswerStatus("idle");
       setFollowLocked(false);
+      setLoadingNext(false);
     },
     [answersState, codeByQuestion, current?.startedAt, current?.timer, setSession, setInterviewId, storageKey]
   );
@@ -349,10 +361,12 @@ const currentIndex =
   const loadNextQuestion = async () => {
     if (!current?.id) return;
     try {
+      setLoadingNext(true);
       const next = await api.nextQuestion(current.id);
       applyNextQuestion(next);
     } catch (e) {
       console.warn("nextQuestion failed", e);
+      setLoadingNext(false);
     }
   };
 
@@ -474,6 +488,11 @@ const currentIndex =
 
   return (
     <>
+      {loadingNext && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 text-white text-lg font-semibold">
+          Переходим к следующему вопросу...
+        </div>
+      )}
     <main className="space-y-3 select-none px-0">
       <TaskCard
         description={current.description ?? ""}
@@ -493,6 +512,7 @@ const currentIndex =
               onClick={async () => {
                 if (!q.id || q.id.startsWith("placeholder")) {
                   if (totalCount && usedCount >= totalCount) return;
+                  setLoadingNext(true);
                   const next = await api.nextQuestion(current.id);
                   const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
                   const updatedUsed = (merged.usedQuestions ?? current.usedQuestions ?? []).length
@@ -502,6 +522,7 @@ const currentIndex =
                         ...(merged.questionId ? [{ id: merged.questionId, title: merged.questionTitle, qType: merged.useIDE ? "coding" : "theory", codeTaskId: merged.codeTaskId, position: (current.usedQuestions?.length ?? 0) }] : []),
                       ];
                   setSession({ ...merged, usedQuestions: updatedUsed, total: merged.total ?? updatedUsed.length });
+                  setLoadingNext(false);
                   setInterviewId(merged.id);
                   setFollowUpQuestion(null);
                   setFollowUpAnswer("");

@@ -321,6 +321,14 @@ def ensure_schema():
         cur.execute("ALTER TABLE session_questions ADD COLUMN meta_json TEXT")
     if "q_type" not in sq_cols:
         cur.execute("ALTER TABLE session_questions ADD COLUMN q_type TEXT DEFAULT 'coding'")
+    if "code_followup_question" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN code_followup_question TEXT")
+    if "code_followup_answer" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN code_followup_answer TEXT")
+    if "code_followup_score" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN code_followup_score INTEGER")
+    if "code_followup_max" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN code_followup_max INTEGER")
     if "code_task_id" not in sq_cols:
         cur.execute("ALTER TABLE session_questions ADD COLUMN code_task_id TEXT")
     if "category" not in sq_cols:

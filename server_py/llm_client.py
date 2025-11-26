@@ -55,6 +55,8 @@ def chat_completion(model: str, messages: list, **kwargs):
         "max_tokens": kwargs.get("max_tokens", 800),
         "stream": kwargs.get("stream", False),
     }
+    if kwargs.get("response_format"):
+        params["response_format"] = kwargs["response_format"]
     try:
         if client is None:
             raise RuntimeError("LLM client is not initialized")
