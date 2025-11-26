@@ -47,13 +47,16 @@ export type InterviewSession = {
   questionId?: string;
   questionTitle?: string;
   useIDE?: boolean;
-  usedQuestions?: { id: string; title?: string }[];
+  usedQuestions?: { id: string; title?: string; qType?: string; codeTaskId?: string }[];
+  codeTaskId?: string;
+  language?: string;
   direction: string;
   level: Level;
   format: string;
   tasks: string[];
   description: string;
   starterCode: string;
+  functionSignature?: string;
   timer: number;
   startedAt?: string;
   solved: number;

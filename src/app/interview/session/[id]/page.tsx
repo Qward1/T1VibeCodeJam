@@ -25,6 +25,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     interviewId,
     setSession,
     setInterviewId,
+    setCode,
     code,
     testResult,
     setTestResult,
@@ -47,9 +48,34 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   }, [session, storedSession?.startedAt, storedSession?.timer, setSession, setInterviewId]);
 
   const mutation = useMutation({
-    mutationFn: () => api.checkSolution(params.id, code),
+    mutationFn: async () => {
+      if (!current?.id || !current?.questionId || !current?.codeTaskId || !user?.id) throw new Error("missing_params");
+      return api.checkCode({
+        sessionId: current.id,
+        questionId: current.questionId,
+        taskId: current.codeTaskId,
+        code,
+        language: current.language || "python",
+        ownerId: user?.id,
+      });
+    },
     onSuccess: (result) => {
-      setTestResult(result);
+      if (current?.questionId && result?.attempt) {
+        setAttemptsByQuestion((prev) => ({ ...prev, [current.questionId!]: result.attempt }));
+      }
+      const passed = Boolean(result?.hiddenPassed && (result?.publicTests || []).every((t: any) => t.status === "passed"));
+      const cases = (result?.publicTests || []).map((t: any) => ({
+        name: t.name,
+        passed: t.status === "passed",
+        details: t.status === "failed" ? `ожидалось ${JSON.stringify(t.expected)}, получено ${JSON.stringify(t.actual)}` : undefined,
+      }));
+      const summary = result?.hasError
+        ? "Ошибка выполнения кода"
+        : passed
+          ? "Все тесты пройдены"
+          : "Часть тестов не пройдена";
+      setTestResult({ passed, summary, cases });
+      setLastTestKind("check");
       const now = Date.now();
       if (lastCodeChange.current && now - lastCodeChange.current < 10000 && current?.id) {
         api.sendAntiCheat({
@@ -60,14 +86,89 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         });
       }
       lastTestAt.current = now;
+      // Если бэкенд вернул новый вопрос — добавляем кнопку
+      if (result?.finished && result?.nextQuestion) {
+        const nextQ = result.nextQuestion;
+        setSession((prev) => {
+          if (!prev) return prev;
+          const used = prev.usedQuestions ?? [];
+          const already = used.find((q) => q.id === nextQ.id);
+          const updatedUsed = already
+            ? used
+            : [...used, { id: nextQ.id, title: nextQ.title, qType: nextQ.qType, codeTaskId: nextQ.codeTaskId, position: nextQ.position }];
+          const total = Math.max(prev.total ?? updatedUsed.length, updatedUsed.length);
+          return {
+            ...prev,
+            usedQuestions: updatedUsed,
+            total,
+            questionId: nextQ.id,
+            questionTitle: nextQ.title,
+            useIDE: nextQ.qType === "coding",
+            codeTaskId: nextQ.codeTaskId ?? prev.codeTaskId,
+            starterCode: nextQ.starterCode ?? prev.starterCode,
+          };
+        });
+        const starter = nextQ.starterCode as string | undefined;
+        setCodeByQuestion((prev) => {
+          const updated = { ...prev };
+          if (starter && !(nextQ.id in updated)) {
+            updated[nextQ.id] = starter;
+          }
+          if (typeof window !== "undefined") {
+            try {
+              localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
+            } catch {
+              // ignore
+            }
+          }
+          return updated;
+        });
+        // сразу переключаем редактор на новую задачу
+        if (nextQ.qType === "coding") {
+          const fromCache = codeByQuestion[nextQ.id];
+          const initialCode = fromCache ?? starter ?? "";
+          setCode(initialCode);
+        } else {
+          setCode("");
+        }
+        // сбрасываем состояния для нового вопроса
+        setAnswer("");
+        setFollowUpQuestion(null);
+        setFollowUpAnswer("");
+        setMissingPoints([]);
+        setBaseScore(null);
+        setFollowLocked(false);
+      }
     },
   });
   const runMutation = useMutation({
-    mutationFn: () => api.runCode(current?.id ?? params.id, code, "python"),
-    onSuccess: (res) => setRunResult(res),
+    mutationFn: async () => {
+      if (!current?.id || !current?.questionId || !current?.codeTaskId || !user?.id) throw new Error("missing_params");
+      return api.runSamples({
+        sessionId: current.id,
+        questionId: current.questionId,
+        taskId: current.codeTaskId,
+        code,
+        language: current.language || "python",
+        ownerId: user?.id,
+      });
+    },
+    onSuccess: (res) => {
+      setRunResult(res);
+      setLastTestKind("run");
+    },
   });
 
   const [answer, setAnswer] = useState("");
+  const [codeByQuestion, setCodeByQuestion] = useState<Record<string, string>>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = localStorage.getItem("vibe-code-by-question");
+      return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    } catch {
+      return {};
+    }
+  });
   const [answersState, setAnswersState] = useState<Record<string, string>>({});
   const [followUpQuestion, setFollowUpQuestion] = useState<string | null>(null);
   const [followUpAnswer, setFollowUpAnswer] = useState("");
@@ -95,17 +196,18 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const [paneRatio, setPaneRatio] = useState(0.55); // доля редактора
   const [editorHeight, setEditorHeight] = useState(600);
   const [runResult, setRunResult] = useState<{
-    status?: string;
-    stdout?: string;
-    stderr?: string;
-    executionTimeMs?: number;
-    errorType?: string;
+    tests?: { name: string; status: string; expected: any; actual: any }[];
+    hasError?: boolean;
   } | null>(null);
   const [supportOpen, setSupportOpen] = useState(false);
   const [supportMessages, setSupportMessages] = useState<
     { id: string; role: string; content: string; createdAt: string }[]
   >([]);
   const [supportInput, setSupportInput] = useState("");
+  const [lastTestKind, setLastTestKind] = useState<"check" | "run" | null>(null);
+  const [attemptsByQuestion, setAttemptsByQuestion] = useState<Record<string, number>>({});
+  const [finishConfirm, setFinishConfirm] = useState(false);
+  const [scoreModal, setScoreModal] = useState<{ open: boolean; score: number | null }>({ open: false, score: null });
   const current = storedSession ?? session ?? null;
   const currentIndex =
     current && current.usedQuestions
@@ -124,10 +226,17 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   useEffect(() => {
     const load = async () => {
       if (current?.id && current.questionId) {
-        // Всегда подтягиваем с бэка, чтобы избежать устаревшего состояния
         const res = await api.getAnswer(current.id, current.questionId);
         setAnswer(res.content);
         setAnswersState((prev) => ({ ...prev, [current.questionId]: res.content ?? "" }));
+        // Кодовый ответ: используем сохранённый код или starter
+        if (current.useIDE) {
+          const savedLocal = codeByQuestion[current.questionId];
+          const savedBackend = res.content ?? "";
+          const finalCode = savedLocal ?? (savedBackend || current.starterCode || "");
+          setCode(finalCode);
+          setCodeByQuestion((prev) => ({ ...prev, [current.questionId]: finalCode }));
+        }
         if (res.decision && res.decision !== "clarify") {
           setFollowLocked(true);
         } else {
@@ -150,19 +259,44 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       }
     };
     load();
-  }, [current?.id, current?.questionId, followUpState, answersState]);
+  }, [current?.id, current?.questionId]);
 
   const loadNextQuestion = async () => {
     if (!current?.id) return;
     try {
       const next = await api.nextQuestion(current.id);
       const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
-      setSession(merged);
+      // Обновляем usedQuestions локально, если бэкенд не прислал новый список
+      setSession((prev) => {
+        const base = { ...(merged || prev || {}) };
+        const prevUsed = base.usedQuestions ?? prev?.usedQuestions ?? [];
+        const exists = base.questionId ? prevUsed.find((q) => q.id === base.questionId) : undefined;
+        const updatedUsed = exists || !base.questionId ? prevUsed : [...prevUsed, { id: base.questionId, title: base.questionTitle, qType: base.useIDE ? "coding" : "theory", codeTaskId: base.codeTaskId, position: prevUsed.length }];
+        return { ...base, usedQuestions: updatedUsed, total: base.total ?? updatedUsed.length };
+      });
       setInterviewId(merged.id);
       if (merged.questionId && answersState[merged.questionId] !== undefined) {
         setAnswer(answersState[merged.questionId]);
       } else {
         setAnswer("");
+      }
+      if (merged.useIDE) {
+        const cached = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
+        setCodeByQuestion((prev) => {
+          const updated = { ...prev };
+          if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
+            updated[merged.questionId] = merged.starterCode;
+          }
+          if (typeof window !== "undefined") {
+            try {
+              localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
+            } catch {
+              // ignore
+            }
+          }
+          return updated;
+        });
+        setCode(cached);
       }
       setFollowUpQuestion(null);
       setFollowUpAnswer("");
@@ -311,16 +445,42 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
             }`}
             onClick={async () => {
               if (!q.id || q.id.startsWith("placeholder")) {
-                // Если лимит вопросов исчерпан — ничего не делаем
                 if (totalCount && usedCount >= totalCount) return;
                 const next = await api.nextQuestion(current.id);
                 const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
-                setSession(merged);
+                const updatedUsed = (merged.usedQuestions ?? current.usedQuestions ?? []).length
+                  ? merged.usedQuestions ?? current.usedQuestions ?? []
+                  : [
+                      ...(current.usedQuestions ?? []),
+                      ...(merged.questionId ? [{ id: merged.questionId, title: merged.questionTitle, qType: merged.useIDE ? "coding" : "theory", codeTaskId: merged.codeTaskId, position: (current.usedQuestions?.length ?? 0) }] : []),
+                    ];
+                setSession({ ...merged, usedQuestions: updatedUsed, total: merged.total ?? updatedUsed.length });
                 setInterviewId(merged.id);
-                if (merged.questionId) {
-                  setAnswer(answersState[merged.questionId] ?? "");
+                setFollowUpQuestion(null);
+                setFollowUpAnswer("");
+                setMissingPoints([]);
+                setBaseScore(null);
+                setFollowLocked(false);
+                setAnswer("");
+                if (merged.useIDE) {
+                  const initial = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
+                  setCode(initial);
+                  setCodeByQuestion((prev) => {
+                    const updated = { ...prev };
+                    if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
+                      updated[merged.questionId] = merged.starterCode;
+                    }
+                    if (typeof window !== "undefined") {
+                      try {
+                        localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
+                      } catch {
+                        // ignore
+                      }
+                    }
+                    return updated;
+                  });
                 } else {
-                  setAnswer("");
+                  setCode("");
                 }
               } else {
                 const s = await api.getInterviewSession(current.id, q.id);
@@ -330,6 +490,11 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                 const content = await api.getAnswer(merged.id, merged.questionId ?? "");
                 setAnswer(content.content ?? "");
                 setAnswersState((prev) => ({ ...prev, [merged.questionId ?? ""]: content.content ?? "" }));
+                setFollowUpQuestion(null);
+                setFollowUpAnswer("");
+                setMissingPoints([]);
+                setBaseScore(null);
+                setFollowLocked(false);
               }
             }}
           >
@@ -363,6 +528,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                 }}
                 placeholder="Опишите решение или вставьте код, если нет IDE"
               />
+              <div className="mt-2 flex justify-start">
               <Button
                 onClick={async () => {
                   if (!current.id || !current.questionId) return;
@@ -405,10 +571,11 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                   }
                 }}
                 size="md"
-                className="w-full"
+                className="w-1/3 min-w-[180px]"
               >
-                {answerStatus === "saving" ? "Сохраняем..." : answerStatus === "saved" ? "Сохранено" : "Сохранить ответ"}
+                {answerStatus === "saving" ? "Отправляем..." : answerStatus === "saved" ? "Отправлено" : "Отправить ответ"}
               </Button>
+              </div>
               {followUpQuestion && (
                 <div className="mt-4 space-y-2">
                   <div className="text-sm font-semibold">Уточняющий вопрос</div>
@@ -478,9 +645,23 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
               <EditorPane
                 sessionId={current.id}
                 questionId={current.questionId}
+                starterCode={current.starterCode}
+                savedCode={codeByQuestion[current.questionId ?? ""] ?? code}
                 height={editorHeight}
-                onCodeChange={() => {
+                onCodeChange={(value) => {
                   lastCodeChange.current = Date.now();
+                  if (current?.questionId) {
+                    const updated = { ...codeByQuestion, [current.questionId]: value ?? "" };
+                    setCodeByQuestion(updated);
+                    if (typeof window !== "undefined") {
+                      try {
+                        localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
+                      } catch {
+                        // ignore
+                      }
+                    }
+                    setCode(value ?? "");
+                  }
                 }}
                 onHeavyPaste={(len) => {
                   api.sendAntiCheat({
@@ -495,49 +676,60 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                 <Button
                   onClick={() => runMutation.mutate()}
                   variant="outline"
-                  disabled={runMutation.isPending}
+                  disabled={
+                    runMutation.isPending ||
+                    !current?.codeTaskId ||
+                    (current?.questionId && (attemptsByQuestion[current.questionId] ?? 0) >= 3)
+                  }
                   className="flex-1 min-w-[140px] bg-[rgba(109,65,128,0.25)] text-[rgb(109,65,128)] border border-[rgba(109,65,128,0.55)] hover:bg-[rgba(109,65,128,0.35)] shadow-sm"
                 >
-                  {runMutation.isPending ? "Код выполняется..." : "Запустить код"}
+                  {runMutation.isPending ? "Выполняем примеры..." : "Запустить примеры"}
                 </Button>
                 <Button
                   onClick={() => mutation.mutate()}
-                  disabled={mutation.isPending}
+                  disabled={
+                    mutation.isPending ||
+                    !current?.codeTaskId ||
+                    (current?.questionId && (attemptsByQuestion[current.questionId] ?? 0) >= 3)
+                  }
                   size="lg"
                   className="flex-1 min-w-[140px] bg-gradient-to-r from-vibe-500 to-vibe-700 text-white hover:brightness-110"
                 >
-                  {mutation.isPending ? "Отправляем..." : "Отправить решение"}
+                  {mutation.isPending ? "Проверяем..." : "Проверить решение"}
                 </Button>
               </div>
-              <Card className="mt-3">
-                <div className="text-sm font-semibold">Результат выполнения</div>
-                <div className="mt-2 space-y-2 text-sm">
-                  <div>
-                    <div className="text-[var(--muted)]">stdout:</div>
-                    <pre className="rounded-lg bg-[var(--card)] p-2 text-xs whitespace-pre-wrap">
-                      {runResult?.stdout || "—"}
-                    </pre>
-                  </div>
-                  <div>
-                    <div className="text-[var(--muted)]">stderr:</div>
-                    <pre className="rounded-lg bg-[var(--card)] p-2 text-xs text-rose-500 whitespace-pre-wrap">
-                      {runResult?.stderr || "—"}
-                    </pre>
-                  </div>
-                  {runResult?.errorType && (
-                    <div className="text-sm text-rose-600">Не удалось выполнить код</div>
+              {lastTestKind === "check" && <TestResults result={testResult} />}
+              {lastTestKind === "run" && runResult && (
+                <div className="mt-3 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-3">
+                  <div className="mb-2 font-semibold">Результаты примеров</div>
+                  {runResult.hasError && (
+                    <div className="text-sm text-rose-500">
+                      Ошибка выполнения кода{runResult.error ? `: ${runResult.error}` : ""}
+                    </div>
                   )}
-                  {runResult?.executionTimeMs !== undefined && (
-                    <div className="text-xs text-[var(--muted)]">
-                      Время: {runResult.executionTimeMs} мс, статус: {runResult.status ?? "—"}
+                  {!runResult.hasError && (
+                    <div className="space-y-2 text-sm">
+                      {(runResult.tests || []).map((t) => (
+                        <div key={t.name} className="rounded-xl border border-[var(--border)] px-3 py-2">
+                          <div className="flex items-center justify-between">
+                            <span className="font-medium">{t.name}</span>
+                            <span className={t.status === "passed" ? "text-emerald-500" : t.status === "failed" ? "text-amber-500" : "text-rose-500"}>
+                              {t.status === "passed" ? "OK" : t.status === "failed" ? "Fail" : "Error"}
+                            </span>
+                          </div>
+                          <div className="text-xs text-[var(--muted)]">
+                            <div>Ожидалось: {JSON.stringify(t.expected)}</div>
+                            <div>Получено: {JSON.stringify(t.actual)}</div>
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
-              </Card>
-              <TestResults result={testResult} />
+              )}
             </Card>
           )}
-          {!current.useIDE && <TestResults result={testResult} />}
+          {!current.useIDE && lastTestKind === "check" && <TestResults result={testResult} />}
         </div>
         {current.useIDE && (
           <div
@@ -554,21 +746,39 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
           <Button
             variant="outline"
             className="mt-3 border-rose-400 bg-rose-50 text-rose-700 shadow-sm hover:bg-rose-100 dark:border-rose-500/70 dark:bg-rose-900/30 dark:text-rose-100 dark:hover:bg-rose-900/50"
-            onClick={async () => {
-              await api.finishInterview(current.id);
-              // Очищаем временные уведомления анти-чита на клиенте, данные в БД остаются
-              queryClient.setQueryData(["admin-events"], []);
-              // Сбрасываем локальный стейт, чтобы кнопки вели на новый старт
-              reset();
-              alert("Собеседование окончено");
-              router.push("/profile");
-            }}
+            onClick={() => setFinishConfirm(true)}
           >
             Завершить собеседование
           </Button>
         </div>
       </div>
     </main>
+    {finishConfirm && (
+      <div className="fixed inset-0 z-[3000] flex items-center justify-center bg-black/40 p-4">
+        <div className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-2xl">
+          <div className="mb-3 text-lg font-semibold">Вы точно хотите завершить?</div>
+          <p className="text-sm text-[var(--muted)] mb-4">Все несохранённые ответы будут потеряны.</p>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setFinishConfirm(false)}>
+              Нет
+            </Button>
+            <Button
+              className="bg-rose-500 text-white hover:bg-rose-600"
+              onClick={async () => {
+                if (!current?.id) return;
+                const sc = await api.finishInterview(current.id);
+                queryClient.setQueryData(["admin-events"], []);
+                reset();
+                setFinishConfirm(false);
+                setScoreModal({ open: true, score: sc ?? null });
+              }}
+            >
+              Да
+            </Button>
+          </div>
+        </div>
+      </div>
+    )}
     {/* Кнопка поддержки */}
     <button
       aria-label="Открыть поддержку"
@@ -637,6 +847,28 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
               }}
             >
               Отправить
+            </Button>
+          </div>
+        </div>
+      </div>
+    )}
+    {scoreModal.open && (
+      <div className="fixed inset-0 z-[3500] flex items-center justify-center bg-black/40 p-4">
+        <div className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-2xl text-center">
+          <div className="text-lg font-semibold mb-2">Итоговый Score</div>
+          <div className="text-3xl font-bold text-vibe-600 mb-3">
+            {scoreModal.score !== null ? scoreModal.score : "—"}
+          </div>
+          <p className="text-sm text-[var(--muted)] mb-4">Спасибо за прохождение собеседования!</p>
+          <div className="flex justify-center gap-2">
+            <Button
+              className="bg-vibe-600 text-white hover:bg-vibe-700"
+              onClick={() => {
+                setScoreModal({ open: false, score: null });
+                router.push("/profile");
+              }}
+            >
+              Закрыть
             </Button>
           </div>
         </div>

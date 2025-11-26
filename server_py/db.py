@@ -128,6 +128,57 @@ def ensure_schema():
         )
         """
     )
+    # Таблицы для кодовых задач (больше не дропаем, чтобы не терять данные)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS code_tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id TEXT UNIQUE,
+          track TEXT,
+          level TEXT,
+          category TEXT,
+          language TEXT,
+          allowed_languages_json TEXT,
+          title TEXT,
+          description_markdown TEXT,
+          function_signature TEXT,
+          starter_code TEXT,
+          constraints_json TEXT,
+          reference_solution TEXT,
+          topic TEXT,
+          raw_json TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS code_tests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id TEXT,
+          name TEXT,
+          is_public INTEGER,
+          input_json TEXT,
+          expected_json TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS code_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT,
+          question_id TEXT,
+          task_id TEXT,
+          owner_id TEXT,
+          attempt_number INTEGER,
+          code TEXT,
+          passed_public INTEGER,
+          passed_hidden INTEGER,
+          score INTEGER,
+          created_at DATETIME
+        )
+        """
+    )
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS session_questions (
@@ -135,7 +186,13 @@ def ensure_schema():
           sessionId TEXT NOT NULL,
           questionId TEXT NOT NULL,
           questionTitle TEXT,
-          position INTEGER
+          position INTEGER,
+          meta_json TEXT,
+          q_type TEXT DEFAULT 'coding',
+          code_task_id TEXT,
+          category TEXT,
+          status TEXT DEFAULT 'active',
+          is_finished INTEGER DEFAULT 0
         )
         """
     )
@@ -185,7 +242,8 @@ def ensure_schema():
           sessionId TEXT NOT NULL,
           ownerId TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'completed',
-          finishedAt TEXT DEFAULT CURRENT_TIMESTAMP
+          finishedAt TEXT DEFAULT CURRENT_TIMESTAMP,
+          score INTEGER
         )
         """
     )
@@ -193,6 +251,8 @@ def ensure_schema():
     ir_cols = [c[1] for c in cur.execute("PRAGMA table_info(interview_results)").fetchall()]
     if "finishedAt" not in ir_cols:
         cur.execute("ALTER TABLE interview_results ADD COLUMN finishedAt TEXT DEFAULT CURRENT_TIMESTAMP")
+    if "score" not in ir_cols:
+        cur.execute("ALTER TABLE interview_results ADD COLUMN score INTEGER")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS answers (
@@ -230,6 +290,20 @@ def ensure_schema():
         cur.execute("ALTER TABLE answers ADD COLUMN max_score INTEGER")
     if "decision" not in ans_cols:
         cur.execute("ALTER TABLE answers ADD COLUMN decision TEXT")
+    # Добавляем недостающие поля в session_questions
+    sq_cols = [c[1] for c in cur.execute("PRAGMA table_info(session_questions)").fetchall()]
+    if "meta_json" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN meta_json TEXT")
+    if "q_type" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN q_type TEXT DEFAULT 'coding'")
+    if "code_task_id" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN code_task_id TEXT")
+    if "category" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN category TEXT")
+    if "status" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN status TEXT DEFAULT 'active'")
+    if "is_finished" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN is_finished INTEGER DEFAULT 0")
     # Добавляем недостающие колонки в session_questions
     sq_cols = [c[1] for c in cur.execute("PRAGMA table_info(session_questions)").fetchall()]
     if "meta_json" not in sq_cols:

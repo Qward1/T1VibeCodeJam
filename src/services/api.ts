@@ -496,23 +496,23 @@ export const api = {
     });
   },
 
-  async finishInterview(sessionId: string) {
+  async finishInterview(sessionId: string): Promise<number | null> {
     if (useBackend && API_BASE) {
       try {
         if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
         try {
-          await call<{ status: string }>(`/api/session/finish`, {
+          const res = await call<{ status: string; score?: number }>(`/api/session/finish`, {
             method: "POST",
             body: JSON.stringify({ sessionId, ownerId: activeUser.id }),
           });
-          return true;
+          return res?.score ?? null;
         } catch {
           // Совместимость со старым роутом, если вдруг нужен
-          await call<{ status: string }>(`/api/interview/finish`, {
+          const res2 = await call<{ status: string; score?: number }>(`/api/interview/finish`, {
             method: "POST",
             body: JSON.stringify({ sessionId, ownerId: activeUser.id }),
           });
-          return true;
+          return res2?.score ?? null;
         }
       } catch (e) {
         console.warn("finishInterview backend failed, falling back", e);
@@ -522,7 +522,7 @@ export const api = {
     if (localSessions[sessionId]) {
       delete localSessions[sessionId];
     }
-    return withDelay(true);
+    return withDelay(null);
   },
 
   async saveAnswer(sessionId: string, questionId: string, content: string) {
@@ -743,19 +743,40 @@ export const api = {
     return withDelay(true);
   },
 
-  async checkSolution(sessionId: string, code: string): Promise<TestResult> {
+  async runSamples(params: { sessionId: string; questionId: string; taskId: string; code: string; language: string; ownerId?: string }): Promise<{ tests: any[]; hasError: boolean }> {
     if (useBackend && API_BASE) {
-      const { result } = await call<{ result: TestResult }>(`/api/session/${sessionId}/check`, {
+      const ownerId = params.ownerId || activeUser?.id;
+      if (!ownerId) throw new Error("NO_ACTIVE_USER");
+      return call<{ tests: any[]; hasError: boolean }>(`/api/code/run-samples`, {
         method: "POST",
-        body: JSON.stringify({ code }),
+        body: JSON.stringify({ ...params, ownerId }),
       });
-      return result;
     }
-    const isPassing = code.toLowerCase().includes("map") || Math.random() > 0.5;
-    const result: TestResult = isPassing
-      ? { ...defaultTestResult, passed: true, summary: "Все тесты зелёные" }
-      : defaultTestResult;
-    return withDelay(result, 700);
+    return withDelay({ tests: [], hasError: false });
+  },
+
+  async checkCode(params: { sessionId: string; questionId: string; taskId: string; code: string; language: string; ownerId?: string }): Promise<any> {
+    if (useBackend && API_BASE) {
+      const ownerId = params.ownerId || activeUser?.id;
+      if (!ownerId) throw new Error("NO_ACTIVE_USER");
+      return call<any>(`/api/code/check`, {
+        method: "POST",
+        body: JSON.stringify({ ...params, ownerId }),
+      });
+    }
+    // mock: always passed public, hidden
+    return withDelay({
+      solved: true,
+      attempt: 1,
+      score: 10,
+      maxScore: 10,
+      publicTests: [
+        { name: "пример_1", status: "passed", expected: 6, actual: 6 },
+        { name: "пример_2", status: "passed", expected: -1, actual: -1 },
+      ],
+      hiddenPassed: true,
+      hasError: false,
+    });
   },
 
   async getReport(id: string): Promise<InterviewReport> {

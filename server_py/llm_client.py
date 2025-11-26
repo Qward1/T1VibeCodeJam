@@ -30,10 +30,15 @@ def load_env_key():
 
 api_key = load_env_key() or "dev-token"
 
-client = OpenAI(
-    base_url=BASE_URL,
-    api_key=api_key,
-)
+try:
+    client = OpenAI(
+        base_url=BASE_URL,
+        api_key=api_key,
+    )
+except Exception as exc:
+    # Если установлен старый openai-клиент — не падаем, логируем и используем заглушку
+    logging.exception("Failed to init OpenAI client", extra={"base_url": BASE_URL})
+    client = None
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,8 @@ def chat_completion(model: str, messages: list, **kwargs):
         "stream": kwargs.get("stream", False),
     }
     try:
+        if client is None:
+            raise RuntimeError("LLM client is not initialized")
         resp = client.chat.completions.create(**params)
         content = resp.choices[0].message.content
         return content

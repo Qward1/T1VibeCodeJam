@@ -14,6 +14,9 @@ import subprocess
 import tempfile
 import json
 import logging
+import sys
+import re
+import time
 
 # Делаем путь к server_py доступным для импортов при запуске как скрипта
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -32,10 +35,19 @@ from llm_theory import (
     generate_theory_question,
     TheoryDecision,
 )
-from question_utils import pick_question, normalize_task_types, collect_previous_theory_topics
+from llm_code import generate_code_task, parse_function_name, build_tests_for_task
+from question_utils import (
+    pick_question,
+    normalize_task_types,
+    collect_previous_theory_topics,
+    collect_previous_code_topics,
+    save_code_task_and_tests,
+)
+from docker_runner import run_code_in_docker, run_code_with_fallback
 
 MAX_QUESTIONS = 3  # легко менять при необходимости
 TIMER_SECONDS = 45 * 60
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Interview Platform API")
@@ -47,6 +59,10 @@ app.add_middleware(
     allow_headers=["*"]
 )
 app.include_router(next_router)
+
+@app.on_event("startup")
+def _log_startup():
+    logger.info("FastAPI app startup complete")
 
 @app.get("/")
 def root():
@@ -106,6 +122,24 @@ class RunCodePayload(BaseModel):
     sessionId: str
     code: str
     language: str = "javascript"
+
+
+class RunSamplesPayload(BaseModel):
+    sessionId: str
+    questionId: str
+    taskId: str
+    ownerId: str
+    code: str
+    language: str
+
+
+class CheckCodePayload(BaseModel):
+    sessionId: str
+    questionId: str
+    taskId: str
+    ownerId: str
+    code: str
+    language: str
 
 class SupportSendPayload(BaseModel):
     userId: str
@@ -194,6 +228,170 @@ def fetchone_dict(cursor):
         return None
     columns = [col[0] for col in cursor.description]
     return dict(zip(columns, row))
+
+
+def get_code_task_description(cur, code_task_id: Optional[str]) -> Optional[str]:
+    if not code_task_id:
+        return None
+    row = fetchone_dict(cur.execute("SELECT description_markdown FROM code_tasks WHERE task_id=?", (code_task_id,)))
+    return row.get("description_markdown") if row else None
+
+
+def calculate_session_score(cur, session_id: str) -> int:
+    ans_row = fetchone_dict(cur.execute("SELECT COALESCE(SUM(score),0) as s FROM answers WHERE sessionId=?", (session_id,)))
+    code_row = fetchone_dict(cur.execute("SELECT COALESCE(SUM(score),0) as s FROM code_attempts WHERE session_id=?", (session_id,)))
+    ans_score = ans_row.get("s") if ans_row else 0
+    code_score = code_row.get("s") if code_row else 0
+    try:
+        return int(ans_score or 0) + int(code_score or 0)
+    except Exception:
+        return 0
+
+
+def sanitize_starter_code(task: dict) -> str:
+    """
+    Возвращаем безопасный каркас функции: только сигнатура + pass/ TODO.
+    Игнорируем starter_code из LLM, если оно содержит реализацию.
+    """
+    signature = task.get("function_signature") or ""
+    sig = signature.strip()
+    if not sig:
+        return ""
+    # Убираем возможный завершающий код
+    if not sig.endswith(":"):
+        sig = sig + ":"
+    return f"{sig}\n    # TODO: реализуйте функцию\n    pass\n"
+
+
+def _param_count(signature: str) -> Optional[int]:
+    m = re.search(r"def\s+[a-zA-Z_][a-zA-Z0-9_]*\s*\((.*?)\)", signature or "", re.S)
+    if not m:
+        return None
+    raw = m.group(1)
+    params = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p or p.startswith("*"):
+            continue
+        params.append(p)
+    return len(params)
+
+
+def _prepare_runner_input(raw_input, param_count: Optional[int]):
+    if param_count == 1:
+        return [raw_input]
+    if isinstance(raw_input, list):
+        return raw_input
+    return [raw_input]
+
+
+def _prepare_runner_tests(rows: List[dict], param_count: Optional[int]) -> List[dict]:
+    tests = []
+    for idx, row in enumerate(rows):
+        name = row.get("name") or f"test_{idx+1}"
+        try:
+            raw_input = json.loads(row.get("input_json") or "[]")
+        except Exception:
+            raw_input = []
+        try:
+            expected = json.loads(row.get("expected_json") or "null")
+        except Exception:
+            expected = None
+        tests.append(
+            {
+                "name": name,
+                "input": _prepare_runner_input(raw_input, param_count),
+                "expected": expected,
+            }
+        )
+    return tests
+
+
+def score_for_attempt(attempt: int, max_score: int = 10) -> int:
+    if attempt == 1:
+        return max_score
+    if attempt == 2:
+        return int(max_score * 0.7)
+    if attempt == 3:
+        return int(max_score * 0.5)
+    return 0
+
+
+def choose_next_category(cur, session_id: str, track: str) -> Optional[str]:
+    """
+    Внутри одного собеседования хотим 2 algo и 2 domain.
+    Если лимиты исчерпаны — возвращаем None (новые вопросы не генерируем).
+    """
+    rows = fetchall_dicts(
+        cur.execute(
+            "SELECT category FROM session_questions WHERE sessionId=? AND q_type='coding'",
+            (session_id,),
+        )
+    )
+    algo_count = sum(1 for r in rows if (r.get("category") or "").lower() == "algo")
+    domain_count = sum(1 for r in rows if (r.get("category") or "").lower() == "domain")
+    if algo_count < 2:
+        return "algo"
+    if domain_count < 2:
+        return "domain"
+    return None
+
+
+def _is_duplicate_code_task(cur, session_id: str, track: str, category: str, new_task: dict) -> bool:
+    track = (track or "").lower()
+    category = (category or "").lower()
+    new_topic = (new_task.get("topic") or "").strip().lower()
+    new_title = (new_task.get("title") or "").strip().lower()
+    new_desc_prefix = " ".join((new_task.get("description_markdown") or "").strip().lower().split()[:12])
+    rows = fetchall_dicts(
+        cur.execute(
+            """
+            SELECT sq.category, sq.meta_json, sq.questionTitle, ct.topic, ct.title as ct_title, ct.description_markdown as ct_desc, ct.track
+            FROM session_questions sq
+            LEFT JOIN code_tasks ct ON ct.task_id = sq.code_task_id
+            WHERE sq.sessionId=? AND sq.q_type='coding'
+            """,
+            (session_id,),
+        )
+    )
+    for r in rows:
+        r_track = (r.get("track") or "").lower()
+        if r_track and r_track != track:
+            continue
+        r_cat = (r.get("category") or "").lower() or (r.get("meta_json") and json.loads(r.get("meta_json")).get("category", "") or "").lower()
+        if r_cat and r_cat != category:
+            continue
+        topic = (r.get("topic") or r.get("questionTitle") or r.get("ct_title") or "").strip().lower()
+        if not topic and r.get("meta_json"):
+            try:
+                obj = json.loads(r.get("meta_json"))
+                topic = (obj.get("topic") or obj.get("title") or "").strip().lower()
+            except Exception:
+                topic = ""
+        desc = (r.get("ct_desc") or "").strip().lower()
+        desc_prefix = " ".join(desc.split()[:12])
+        if new_topic and topic and new_topic == topic:
+            return True
+        if new_title and ((topic and new_title == topic) or new_title == (r.get("ct_title") or "").strip().lower()):
+            return True
+        if new_desc_prefix and desc_prefix and new_desc_prefix == desc_prefix:
+            return True
+    return False
+
+
+def generate_unique_code_task(cur, session_id: str, track: str, level: str, category: str, language: str) -> dict:
+    prev_algo, prev_domain = collect_previous_code_topics(cur, session_id, track)
+    last_task = None
+    for _ in range(3):
+        task = generate_code_task(track, level, category, language, prev_algo, prev_domain)
+        task["track"] = task.get("track") or track
+        task["level"] = task.get("level") or level
+        task["category"] = task.get("category") or category
+        task["language"] = task.get("language") or language
+        last_task = task
+        if not _is_duplicate_code_task(cur, session_id, track, category, task):
+            return task
+    return last_task or {}
 
 
 def fetchall_dicts(cursor):
@@ -299,22 +497,30 @@ def history(userId: str):
     sessions = fetchall_dicts(cur)
     # Подтягиваем время завершения из результатов
     result_rows = fetchall_dicts(
-        cur.execute("SELECT sessionId, finishedAt FROM interview_results WHERE ownerId=?", (userId,))
+        cur.execute("SELECT sessionId, finishedAt, score FROM interview_results WHERE ownerId=?", (userId,))
     )
     finished_map = {r["sessionId"]: r.get("finishedAt") for r in result_rows if r.get("sessionId")}
+    score_map = {r["sessionId"]: r.get("score") for r in result_rows if r.get("sessionId")}
     conn.close()
     history = []
     for s in sessions:
         finished = finished_map.get(s["id"])
         # Если нет зафиксированного завершения — используем createdAt
         date_val = finished or s.get("createdAt") or now_iso()
+        score_val = score_map.get(s["id"])
+        if score_val is None:
+            try:
+                cur_score = calculate_session_score(sqlite3.connect(DB_PATH).cursor(), s["id"])
+                score_val = cur_score
+            except Exception:
+                score_val = 0
         history.append(
             {
                 "id": s["id"],
                 "topic": (s.get("description") or "Тема")[0:32] + "...",
                 "direction": s.get("direction"),
                 "level": s.get("level"),
-                "score": 70,
+                "score": score_val or 0,
                 "date": date_val,
             }
         )
@@ -349,6 +555,27 @@ def start_interview(payload: StartPayload):
             cur.execute("UPDATE sessions SET startedAt=? WHERE id=?", (started_at, existing["id"]))
             updated = True
         used_questions = get_used_questions(cur, existing["id"])
+        # Подхватываем codeTaskId/language из meta текущего вопроса
+        if existing.get("questionId"):
+            sq = fetchone_dict(
+                cur.execute("SELECT meta_json, code_task_id FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1", (existing["id"], existing["questionId"]))
+            )
+            if sq and sq.get("meta_json"):
+                try:
+                    meta_obj = json.loads(sq.get("meta_json"))
+                    existing["codeTaskId"] = existing.get("codeTaskId") or sq.get("code_task_id")
+                    existing["language"] = meta_obj.get("language") or existing.get("language")
+                    if not existing.get("description"):
+                        existing["description"] = meta_obj.get("description_markdown") or meta_obj.get("question")
+                except Exception:
+                    pass
+            elif sq:
+                existing["codeTaskId"] = existing.get("codeTaskId") or sq.get("code_task_id")
+        # Если описания нет, пробуем подтянуть из code_tasks по codeTaskId
+        if not existing.get("description"):
+            desc = get_code_task_description(cur, existing.get("codeTaskId"))
+            if desc:
+                existing["description"] = desc
         if updated:
             conn.commit()
         conn.close()
@@ -362,6 +589,8 @@ def start_interview(payload: StartPayload):
                 "questionTitle": existing.get("questionTitle"),
                 "questionId": existing.get("questionId"),
                 "useIDE": bool(existing.get("useIDE", 1)),
+                "codeTaskId": existing.get("codeTaskId"),
+                "language": existing.get("language"),
                 "description": existing.get("description"),
                 "starterCode": existing.get("starterCode"),
                 "timer": existing.get("timer"),
@@ -372,9 +601,12 @@ def start_interview(payload: StartPayload):
                 "status": existing.get("status", "active"),
                 "is_active": existing.get("is_active", 1),
                 "is_finished": existing.get("is_finished", 0),
+                "ownerId": existing.get("ownerId"),
             }
         }
     # Всегда генерируем один теоретический вопрос через LLM
+    task_types = normalize_task_types(payload.tasks)
+    dual_mode = "coding" in task_types and "theory" in task_types
     question_id = None
     question_title = "Вопрос 1"
     description = ""
@@ -382,18 +614,45 @@ def start_interview(payload: StartPayload):
     use_ide = False
     meta_json = None
     starter = ""
+    function_signature = None
+    function_signature = None
+    q_obj: dict = {}
 
-    try:
-        # Пока сессия не создана — нет предыдущих вопросов
-        prev_topics: List[str] = []
-        q_obj = generate_theory_question((payload.direction or "fullstack").lower(), (payload.level or "middle").lower(), prev_topics)
-        question_id = f"llm-theory-{uuid.uuid4()}"
-        description = q_obj.get("question", "")
-        question_title = q_obj.get("title") or question_title
-        meta_json = json.dumps(q_obj, ensure_ascii=False)
-    except Exception as exc:
-        logger.exception("LLM generation failed on start-interview", extra={"direction": payload.direction, "level": payload.level})
-        question_id = None
+    # Пробуем сгенерировать coding-задачу, если выбрана и не в дуальном режиме (в дуальном теорию выдаём первой)
+    code_task_id = None
+    if "coding" in task_types and not dual_mode:
+        try:
+            q_obj = generate_unique_code_task(cur, "", (payload.direction or "fullstack").lower(), (payload.level or "middle").lower(), "algo", "python")
+            code_task_id = q_obj.get("task_id") or f"code-{uuid.uuid4()}"
+            public_tests, hidden_tests = build_tests_for_task(q_obj)
+            save_code_task_and_tests(cur, code_task_id, q_obj, public_tests, hidden_tests)
+            question_id = f"llm-code-{uuid.uuid4()}"
+            question_title = q_obj.get("title") or question_title
+            description = q_obj.get("description_markdown", "")
+            question_type = "coding"
+            use_ide = True
+            starter = sanitize_starter_code(q_obj)
+            function_signature = q_obj.get("function_signature")
+            meta_json = json.dumps({**q_obj, "task_id": code_task_id, "starter_code": starter}, ensure_ascii=False)
+        except Exception as exc:
+            logger.exception("LLM coding generation failed on start-interview", extra={"direction": payload.direction, "level": payload.level})
+            question_id = None
+
+    # Если coding не удалось или не выбрано — генерируем theory
+    if not question_id and "theory" in task_types:
+        try:
+            prev_topics: List[str] = []
+            q_obj = generate_theory_question((payload.direction or "fullstack").lower(), (payload.level or "middle").lower(), prev_topics)
+            question_id = f"llm-theory-{uuid.uuid4()}"
+            description = q_obj.get("question", "")
+            question_title = q_obj.get("title") or question_title
+            question_type = "theory"
+            use_ide = False
+            starter = ""
+            meta_json = json.dumps(q_obj, ensure_ascii=False)
+        except Exception as exc:
+            logger.exception("LLM generation failed on start-interview", extra={"direction": payload.direction, "level": payload.level})
+            question_id = None
 
     if not question_id:
         logger.error(
@@ -403,7 +662,7 @@ def start_interview(payload: StartPayload):
         conn.close()
         raise HTTPException(status_code=404, detail="no_questions")
 
-    total_questions = 1
+    total_questions = 10 if dual_mode else 1
     session_id = str(uuid.uuid4())
     started_at = now_iso()
     if question_type == "theory":
@@ -419,11 +678,11 @@ def start_interview(payload: StartPayload):
             payload.userId,
             question_id,
             question_title,
-            int(use_ide),
+            int(question_type == "coding"),
             payload.direction,
             payload.level,
             payload.format,
-            ",".join(["theory"]),
+            ",".join(task_types),
             description,
             starter,
             TIMER_SECONDS,
@@ -438,8 +697,8 @@ def start_interview(payload: StartPayload):
     # Добавляем выбранный вопрос в историю с порядком
     cur.execute(
         """
-        INSERT INTO session_questions (sessionId, questionId, questionTitle, position, meta_json, q_type)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO session_questions (sessionId, questionId, questionTitle, position, meta_json, q_type, code_task_id, category, status, is_finished)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)
         """,
         (
             session_id,
@@ -448,6 +707,8 @@ def start_interview(payload: StartPayload):
             1,
             meta_json,
             question_type or "coding",
+            code_task_id,
+            q_obj.get("category") if question_type == "coding" else None,
         ),
     )
     # Черновик отчёта
@@ -474,13 +735,17 @@ def start_interview(payload: StartPayload):
     return {
         "session": {
             "id": session_id,
+            "questionDisplayId": f"Q-1-{question_id[-6:]}" if question_id else None,
             "direction": payload.direction,
             "level": payload.level,
             "format": payload.format,
-            "tasks": ["theory"],
+            "tasks": task_types,
             "questionTitle": question_title,
             "questionId": question_id,
-            "useIDE": bool(use_ide),
+            "useIDE": bool(question_type == "coding"),
+            "functionSignature": function_signature,
+            "codeTaskId": code_task_id,
+            "language": (q_obj or {}).get("language"),
             "description": description,
             "starterCode": starter,
             "timer": TIMER_SECONDS,
@@ -491,6 +756,7 @@ def start_interview(payload: StartPayload):
             "status": "active",
             "is_active": 1,
             "is_finished": 0,
+            "ownerId": payload.userId,
         }
     }
 
@@ -520,32 +786,60 @@ def get_session(session_id: str, questionId: Optional[str] = None):
         cur.execute("UPDATE sessions SET startedAt=? WHERE id=?", (row["startedAt"], session_id))
         updated = True
     # Если запрашивается конкретный вопрос — подгружаем его
-    if questionId:
-        cur.execute("SELECT * FROM questions WHERE id=?", (questionId,))
+    current_qtype = None
+    meta_obj = None
+    target_qid = questionId or row.get("questionId")
+    if target_qid:
+        cur.execute("SELECT * FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1", (session_id, target_qid))
+        sq_row = fetchone_dict(cur)
+        if sq_row:
+            current_qtype = sq_row.get("q_type")
+            row["codeTaskId"] = sq_row.get("code_task_id")
+            if sq_row.get("meta_json"):
+                try:
+                    meta_obj = json.loads(sq_row.get("meta_json"))
+                except Exception:
+                    meta_obj = None
+        cur.execute("SELECT * FROM questions WHERE id=?", (target_qid,))
         q = fetchone_dict(cur)
         if q:
             row["questionId"] = q["id"]
             row["questionTitle"] = q["title"]
             row["description"] = q["statement"]
             row["useIDE"] = q.get("useIDE", 1)
-        else:
-            # Пробуем достать LLM-вопрос из session_questions.meta_json
-            meta = cur.execute(
-                "SELECT meta_json FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1",
-                (session_id, questionId),
-            ).fetchone()
-            if meta and meta[0]:
-                try:
-                    meta_obj = json.loads(meta[0])
-                    row["questionId"] = questionId
-                    row["questionTitle"] = meta_obj.get("title") or row.get("questionTitle")
-                    row["description"] = meta_obj.get("question") or row.get("description")
-                    row["useIDE"] = 0
-                except Exception:
-                    pass
+        elif meta_obj:
+            row["questionId"] = target_qid
+            row["questionTitle"] = meta_obj.get("title") or row.get("questionTitle")
+            row["description"] = meta_obj.get("description_markdown") or meta_obj.get("question") or row.get("description")
+            row["starterCode"] = meta_obj.get("starter_code") or row.get("starterCode")
+            row["functionSignature"] = meta_obj.get("function_signature")
+            row["useIDE"] = 1 if current_qtype == "coding" else 0
+            row["codeTaskId"] = row.get("codeTaskId") or meta_obj.get("task_id")
+            row["language"] = meta_obj.get("language") or row.get("language")
+    # Если описание пустое и есть привязанный code_task_id — подтащим из code_tasks
+    if not row.get("description") and row.get("codeTaskId"):
+        desc = get_code_task_description(cur, row.get("codeTaskId"))
+        if desc:
+            row["description"] = desc
     # История выданных вопросов
     used_questions = fetchall_dicts(
-        cur.execute("SELECT questionId as id, questionTitle as title FROM session_questions WHERE sessionId=? ORDER BY position", (session_id,))
+        cur.execute(
+            """
+            SELECT
+              questionId as id,
+              questionTitle as title,
+              q_type as qType,
+              code_task_id as codeTaskId,
+              position,
+              category,
+              status,
+              is_finished as isFinished
+            FROM session_questions
+            WHERE sessionId=?
+            ORDER BY position
+            """,
+            (session_id,),
+        )
     )
     if updated:
         conn.commit()
@@ -559,12 +853,17 @@ def get_session(session_id: str, questionId: Optional[str] = None):
             "tasks": row.get("tasks", "").split(",") if row.get("tasks") else [],
             "description": row.get("description"),
             "starterCode": row.get("starterCode"),
+            "functionSignature": row.get("functionSignature"),
+            "codeTaskId": row.get("codeTaskId"),
+            "language": row.get("language"),
             "timer": row.get("timer"),
             "startedAt": row.get("startedAt"),
             "solved": row.get("solved"),
             "total": row.get("total"),
             "questionTitle": row.get("questionTitle"),
             "questionId": row.get("questionId"),
+            "questionDisplayId": f"Q-{row.get('questionId')[-6:]}" if row.get("questionId") else None,
+            "ownerId": row.get("ownerId"),
             "useIDE": bool(row.get("useIDE", 1)),
             "usedQuestions": used_questions,
             "status": row.get("status", "active"),
@@ -672,22 +971,31 @@ def admin_overview(adminId: str):
     flags = {row["ownerId"]: row["cnt"] for row in flag_rows if row.get("ownerId")}
     cur.execute("SELECT * FROM users")
     users = fetchall_dicts(cur)
+    candidates = []
+    for u in users:
+        # Последний результат пользователя
+        res = fetchone_dict(
+            cur.execute(
+                "SELECT score FROM interview_results WHERE ownerId=? ORDER BY datetime(finishedAt) DESC LIMIT 1",
+                (u["id"],),
+            )
+        )
+        last_score = res.get("score") if res else 0
+        candidates.append(
+            {
+                "id": u["id"],
+                "name": u["name"],
+                "email": u["email"],
+                "level": u["level"],
+                "admin": bool(u.get("admin")),
+                "role": u.get("role"),
+                "hasFlags": bool(flags.get(u["id"])),
+                "flagsCount": flags.get(u["id"], 0),
+                "lastScore": last_score or 0,
+                "lastTopic": "Собеседование",
+            }
+        )
     conn.close()
-    candidates = [
-        {
-            "id": u["id"],
-            "name": u["name"],
-            "email": u["email"],
-            "level": u["level"],
-            "admin": bool(u.get("admin")),
-            "role": u.get("role"),
-            "hasFlags": bool(flags.get(u["id"])),
-            "flagsCount": flags.get(u["id"], 0),
-            "lastScore": 70,
-            "lastTopic": "System Design",
-        }
-        for u in users
-    ]
     analytics = {
         "hardestTopics": [
             {"name": "Concurrency", "score": 62},
@@ -788,6 +1096,364 @@ def run_code(payload: RunCodePayload):
         "executionTimeMs": exec_ms,
         "errorType": error_type,
     }
+
+
+def _resolve_task_id(cur, session_id: Optional[str], question_id: Optional[str], task_id: Optional[str]) -> Optional[str]:
+    if task_id:
+        return task_id
+    if session_id and question_id:
+        sq = fetchone_dict(
+            cur.execute(
+                "SELECT code_task_id, meta_json FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1",
+                (session_id, question_id),
+            )
+        )
+        if sq:
+            if sq.get("code_task_id"):
+                return sq.get("code_task_id")
+            if sq.get("meta_json"):
+                try:
+                    meta = json.loads(sq.get("meta_json"))
+                    if meta.get("task_id"):
+                        return meta.get("task_id")
+                except Exception:
+                    pass
+    return task_id
+
+
+def _restore_code_task_from_meta(cur, session_id: Optional[str], question_id: Optional[str], task_id: str):
+    if not session_id or not question_id:
+        return None
+    sq = fetchone_dict(
+        cur.execute(
+            "SELECT meta_json FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1",
+            (session_id, question_id),
+        )
+    )
+    if not sq or not sq.get("meta_json"):
+        return None
+    try:
+        meta = json.loads(sq.get("meta_json"))
+    except Exception:
+        return None
+    # Минимально проверяем обязательные поля
+    if not meta or "reference_solution" not in meta or "sample_inputs" not in meta or "edge_case_inputs" not in meta:
+        return None
+    try:
+        public_tests, hidden_tests = build_tests_for_task(meta)
+        save_code_task_and_tests(cur, task_id, meta, public_tests, hidden_tests)
+        return fetchone_dict(cur.execute("SELECT * FROM code_tasks WHERE task_id=?", (task_id,)))
+    except Exception:
+        return None
+
+
+def _load_task_and_tests(cur, task_id: str, session_id: Optional[str] = None, question_id: Optional[str] = None):
+    task = fetchone_dict(cur.execute("SELECT * FROM code_tasks WHERE task_id=?", (task_id,)))
+    if not task:
+        task = _restore_code_task_from_meta(cur, session_id, question_id, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    public_tests = fetchall_dicts(
+        cur.execute("SELECT * FROM code_tests WHERE task_id=? AND is_public=1 ORDER BY id", (task_id,))
+    )
+    hidden_tests = fetchall_dicts(
+        cur.execute("SELECT * FROM code_tests WHERE task_id=? AND is_public=0 ORDER BY id", (task_id,))
+    )
+    return task, public_tests, hidden_tests
+
+
+def _runner_has_error(run_result: dict) -> tuple[bool, str]:
+    if not run_result:
+        return True, "empty_result"
+    if run_result.get("error"):
+        return True, str(run_result.get("error"))
+    for t in run_result.get("tests", []):
+        if t.get("error"):
+            return True, str(t.get("error"))
+    return False, ""
+
+
+def _tests_from_runner(run_result: dict) -> List[dict]:
+    out = []
+    for t in run_result.get("tests", []):
+        status = "passed" if t.get("passed") else "failed"
+        if t.get("error"):
+            status = "error"
+        out.append(
+            {
+                "name": t.get("name"),
+                "status": status,
+                "expected": t.get("expected"),
+                "actual": t.get("output"),
+            }
+        )
+    return out
+
+
+def _save_attempt(cur, payload: CheckCodePayload, attempt: int, code: str, passed_public: int, passed_hidden: int, score: int, task_id: Optional[str] = None):
+    params = (
+        payload.sessionId,
+        payload.questionId,
+        task_id or payload.taskId,
+        payload.ownerId,
+        attempt,
+        code,
+        passed_public,
+        passed_hidden,
+        score,
+        now_iso(),
+    )
+    for i in range(3):
+        try:
+            cur.execute(
+                """
+                INSERT INTO code_attempts (session_id, question_id, task_id, owner_id, attempt_number, code, passed_public, passed_hidden, score, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or i == 2:
+                raise
+            time.sleep(0.2 * (i + 1))
+
+
+@app.post("/api/code/run-samples")
+def code_run_samples(payload: RunSamplesPayload):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        task_id = _resolve_task_id(cur, payload.sessionId, payload.questionId, payload.taskId)
+        if not task_id:
+            logger.warning("run-samples: task id not resolved", extra={"session": payload.sessionId, "question": payload.questionId})
+            return {"tests": [], "hasError": True, "error": "task_not_found"}
+        try:
+            task, public_tests, _hidden = _load_task_and_tests(cur, task_id, payload.sessionId, payload.questionId)
+        except HTTPException as exc:
+            logger.warning("run-samples: task/tests missing", extra={"task_id": task_id, "detail": exc.detail})
+            return {"tests": [], "hasError": True, "error": str(exc.detail)}
+        if not public_tests:
+            logger.warning("run-samples: no public tests", extra={"task_id": task_id})
+            return {"tests": [], "hasError": True, "error": "no_public_tests"}
+        signature = task.get("function_signature") or task.get("starter_code") or ""
+        function_name = parse_function_name(signature)
+        if not function_name:
+            return {"tests": [], "hasError": True, "error": "function_not_found"}
+        param_count = _param_count(signature)
+        runner_tests = _prepare_runner_tests(public_tests, param_count)
+        try:
+            run_result = run_code_with_fallback(payload.language, payload.code, function_name, runner_tests)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("run-samples docker failed", extra={"task_id": payload.taskId})
+            return {"tests": [], "hasError": True, "error": str(exc)}
+        has_error, err_msg = _runner_has_error(run_result)
+        if has_error:
+            return {"tests": _tests_from_runner(run_result), "hasError": True, "error": err_msg or "runtime_error"}
+        return {"tests": _tests_from_runner(run_result), "hasError": False, "error": None}
+    finally:
+        conn.close()
+
+
+@app.post("/api/code/check")
+def code_check(payload: CheckCodePayload):
+    conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+    cur = conn.cursor()
+    try:
+        session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (payload.sessionId,)))
+        if not session_row:
+            raise HTTPException(status_code=404, detail="session_not_found")
+        task_id = _resolve_task_id(cur, payload.sessionId, payload.questionId, payload.taskId)
+        task, public_tests, hidden_tests = _load_task_and_tests(cur, task_id, payload.sessionId, payload.questionId)
+        signature = task.get("function_signature") or task.get("starter_code") or ""
+        function_name = parse_function_name(signature)
+        if not function_name:
+            raise HTTPException(status_code=400, detail="function_not_found")
+        param_count = _param_count(signature)
+        runner_public = _prepare_runner_tests(public_tests, param_count)
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(attempt_number), 0) AS max_attempt
+            FROM code_attempts
+            WHERE session_id=? AND question_id=? AND task_id=? AND owner_id=?
+            """,
+            (payload.sessionId, payload.questionId, task_id, payload.ownerId),
+        )
+        row = fetchone_dict(cur)
+        attempt = (row.get("max_attempt") or 0) + 1
+
+        finished = False
+        next_question = None
+        response: dict = {}
+        try:
+            public_result = run_code_with_fallback(payload.language, payload.code, function_name, runner_public)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("code check docker error (public)", extra={"task_id": payload.taskId})
+            _save_attempt(cur, payload, attempt, payload.code, 0, 0, 0, task_id)
+            response = {
+                "solved": False,
+                "attempt": attempt,
+                "score": 0,
+                "maxScore": 10,
+                "publicTests": [{"name": "runtime", "status": "error", "expected": None, "actual": str(exc)}],
+                "hiddenPassed": False,
+                "hasError": True,
+                "error": "docker_unavailable",
+            }
+        else:
+            has_error_public, err_msg = _runner_has_error(public_result)
+            public_tests_resp = _tests_from_runner(public_result)
+            if has_error_public:
+                _save_attempt(cur, payload, attempt, payload.code, 0, 0, 0, task_id)
+                response = {
+                    "solved": False,
+                    "attempt": attempt,
+                    "score": 0,
+                    "maxScore": 10,
+                    "publicTests": [{"name": "runtime", "status": "error", "expected": None, "actual": err_msg or "error"}],
+                    "hiddenPassed": False,
+                    "hasError": True,
+                    "error": err_msg or "runtime_error",
+                }
+            else:
+                public_all_passed = all(t.get("status") == "passed" for t in public_tests_resp)
+                if not public_all_passed:
+                    _save_attempt(cur, payload, attempt, payload.code, 0, 0, 0, task_id)
+                    response = {
+                        "solved": False,
+                        "attempt": attempt,
+                        "score": 0,
+                        "maxScore": 10,
+                        "publicTests": public_tests_resp,
+                        "hiddenPassed": False,
+                        "hasError": False,
+                    }
+                else:
+                    runner_hidden = _prepare_runner_tests(hidden_tests, param_count)
+                    try:
+                        hidden_result = run_code_with_fallback(payload.language, payload.code, function_name, runner_hidden)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("code check docker error (hidden)", extra={"task_id": payload.taskId})
+                        _save_attempt(cur, payload, attempt, payload.code, 1, 0, 0, task_id)
+                        response = {
+                            "solved": False,
+                            "attempt": attempt,
+                            "score": 0,
+                            "maxScore": 10,
+                            "publicTests": public_tests_resp,
+                            "hiddenPassed": False,
+                            "hasError": True,
+                            "error": str(exc),
+                        }
+                    else:
+                        has_error_hidden, _ = _runner_has_error(hidden_result)
+                        hidden_tests_resp = _tests_from_runner(hidden_result)
+                        hidden_passed = not has_error_hidden and all(t.get("status") == "passed" for t in hidden_tests_resp)
+                        if not hidden_passed:
+                            _save_attempt(cur, payload, attempt, payload.code, 1, 0, 0, task_id)
+                            response = {
+                                "solved": False,
+                                "attempt": attempt,
+                                "score": 0,
+                                "maxScore": 10,
+                                "publicTests": public_tests_resp,
+                                "hiddenPassed": False,
+                                "hasError": has_error_hidden,
+                                "error": "runtime_error" if has_error_hidden else None,
+                            }
+                        else:
+                            score = score_for_attempt(attempt, 10)
+                            _save_attempt(cur, payload, attempt, payload.code, 1, 1, score, task_id)
+                            response = {
+                                "solved": True,
+                                "attempt": attempt,
+                                "score": score,
+                                "maxScore": 10,
+                                "publicTests": public_tests_resp,
+                                "hiddenPassed": True,
+                                "hasError": False,
+                                "error": None,
+                            }
+                            finished = True
+
+        # Если три попытки — завершаем даже при неудаче
+        if not finished and attempt >= 3:
+            finished = True
+
+        # Помечаем вопрос завершённым и генерируем следующий, если нужно
+        if finished:
+            cur.execute(
+                "UPDATE session_questions SET status='done', is_finished=1 WHERE sessionId=? AND questionId=?",
+                (payload.sessionId, payload.questionId),
+            )
+            try:
+                track = (session_row.get("direction") or "fullstack").lower()
+                level = (session_row.get("level") or "middle").lower()
+                lang = (session_row.get("language") or task.get("language") or "python").lower()
+                category = choose_next_category(cur, payload.sessionId, track)
+                if category:
+                    next_q_obj = generate_unique_code_task(cur, payload.sessionId, track, level, category, lang)
+                    next_code_task_id = next_q_obj.get("task_id") or f"code-{uuid.uuid4()}"
+                    public_tests2, hidden_tests2 = build_tests_for_task(next_q_obj)
+                    save_code_task_and_tests(cur, next_code_task_id, next_q_obj, public_tests2, hidden_tests2)
+                    next_question_id = f"llm-code-{uuid.uuid4()}"
+                    pos = cur.execute("SELECT COUNT(*) FROM session_questions WHERE sessionId=?", (payload.sessionId,)).fetchone()[0] + 1
+                    starter_next = sanitize_starter_code(next_q_obj)
+                    meta_json = json.dumps({**next_q_obj, "task_id": next_code_task_id, "starter_code": starter_next}, ensure_ascii=False)
+                    # Обновляем сессию на новый текущий вопрос
+                    cur.execute(
+                        """
+                        UPDATE sessions
+                        SET questionId=?, questionTitle=?, description=?, starterCode=?, useIDE=1
+                        WHERE id=?
+                        """,
+                        (
+                            next_question_id,
+                            next_q_obj.get("title") or f"Вопрос {pos}",
+                            next_q_obj.get("description_markdown"),
+                            starter_next,
+                            payload.sessionId,
+                        ),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO session_questions (sessionId, questionId, questionTitle, position, meta_json, q_type, code_task_id, category, status, is_finished)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)
+                        """,
+                        (
+                            payload.sessionId,
+                            next_question_id,
+                            next_q_obj.get("title") or f"Вопрос {pos}",
+                            pos,
+                            meta_json,
+                            "coding",
+                            next_code_task_id,
+                            category,
+                        ),
+                    )
+                    next_question = {
+                        "id": next_question_id,
+                        "title": next_q_obj.get("title"),
+                        "description": next_q_obj.get("description_markdown"),
+                        "starterCode": starter_next,
+                        "functionSignature": next_q_obj.get("function_signature"),
+                        "codeTaskId": next_code_task_id,
+                        "qType": "coding",
+                        "category": category,
+                        "position": pos,
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("failed to generate next coding question", extra={"session": payload.sessionId, "question": payload.questionId, "task_id": task_id})
+        conn.commit()
+        response["finished"] = finished
+        response["nextQuestion"] = next_question
+        return response
+    finally:
+        conn.close()
 
 
 @app.post("/api/support/send")
@@ -951,18 +1617,46 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
     use_ide = False
     meta_json = None
     starter = ""
+    q_obj: dict = {}
+    code_task_id = None
+    function_signature = None
+
+    task_types = normalize_task_types((assigned.get("tasks") or "").split(",") if assigned.get("tasks") else [])
+
+    # Сначала пробуем coding, если выбран
+    if "coding" in task_types:
+        try:
+            q_obj = generate_unique_code_task(cur, assigned.get("sessionId") or session_id, (assigned.get("direction") or "fullstack").lower(), (assigned.get("level") or "middle").lower(), "algo", "python")
+            code_task_id = q_obj.get("task_id") or f"code-{uuid.uuid4()}"
+            public_tests, hidden_tests = build_tests_for_task(q_obj)
+            save_code_task_and_tests(cur, code_task_id, q_obj, public_tests, hidden_tests)
+            question_id = f"llm-code-{uuid.uuid4()}"
+            question_title = q_obj.get("title") or question_title
+            description = q_obj.get("description_markdown", "")
+            question_type = "coding"
+            use_ide = True
+            starter = q_obj.get("starter_code", "")
+            function_signature = q_obj.get("function_signature")
+            meta_json = json.dumps({**q_obj, "task_id": code_task_id}, ensure_ascii=False)
+        except Exception as exc:
+            logger.exception("LLM coding generation failed on assigned-interview start", extra={"direction": assigned.get("direction"), "level": assigned.get("level")})
+            question_id = None
 
     # Пытаемся сгенерировать теоретический вопрос для назначенного интервью
-    try:
-        prev_topics = collect_previous_theory_topics(cur, assigned.get("sessionId") or "")
-        q_obj = generate_theory_question((assigned.get("direction") or "fullstack").lower(), (assigned.get("level") or "middle").lower(), prev_topics)
-        question_id = f"llm-theory-{uuid.uuid4()}"
-        description = q_obj.get("question", "")
-        question_title = q_obj.get("title") or question_title
-        meta_json = json.dumps(q_obj, ensure_ascii=False)
-    except Exception as exc:
-        logger.exception("LLM generation failed on assigned-interview start", extra={"direction": assigned.get("direction"), "level": assigned.get("level")})
-        question_id = None
+    if not question_id and "theory" in task_types:
+        try:
+            prev_topics = collect_previous_theory_topics(cur, assigned.get("sessionId") or "")
+            q_obj = generate_theory_question((assigned.get("direction") or "fullstack").lower(), (assigned.get("level") or "middle").lower(), prev_topics)
+            question_id = f"llm-theory-{uuid.uuid4()}"
+            description = q_obj.get("question", "")
+            question_title = q_obj.get("title") or question_title
+            question_type = "theory"
+            use_ide = False
+            starter = ""
+            meta_json = json.dumps(q_obj, ensure_ascii=False)
+        except Exception as exc:
+            logger.exception("LLM generation failed on assigned-interview start", extra={"direction": assigned.get("direction"), "level": assigned.get("level")})
+            question_id = None
 
     # Если теорию не удалось — пробуем coding как фолбэк
     if not question_id:
@@ -981,7 +1675,7 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
         )
         conn.close()
         raise HTTPException(status_code=404, detail="no_questions")
-    total_questions = 1
+    total_questions = 9 if dual_mode else 1
     session_id = str(uuid.uuid4())
     starter = starter if question_type != "theory" else ""
     started_at = now_iso()
@@ -1020,8 +1714,8 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
     )
     cur.execute(
         """
-        INSERT INTO session_questions (sessionId, questionId, questionTitle, position, meta_json, q_type)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO session_questions (sessionId, questionId, questionTitle, position, meta_json, q_type, code_task_id, category, status, is_finished)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0)
         """,
         (
             session_id,
@@ -1030,6 +1724,8 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
             1,
             meta_json,
             question_type or "coding",
+            code_task_id,
+            code_task_id and (q_obj.get("category") if question_type == "coding" else None),
         ),
     )
     cur.execute(
@@ -1078,10 +1774,13 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
             "direction": assigned.get("direction"),
             "level": assigned.get("level"),
             "format": assigned.get("format") or "Full interview",
-            "tasks": ["theory"],
+            "tasks": task_types,
             "questionTitle": question_title,
             "questionId": question_id,
             "useIDE": bool(use_ide),
+            "functionSignature": function_signature,
+            "codeTaskId": code_task_id,
+            "language": (meta_json and json.loads(meta_json).get("language")) if meta_json else None,
             "description": description,
             "starterCode": starter,
             "timer": timer_val,
@@ -1093,6 +1792,7 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
             "is_active": 1,
             "is_finished": 0,
             "assignedId": assigned_id,
+            "ownerId": payload.userId,
         }
     }
 
@@ -1233,7 +1933,19 @@ def active_session(ownerId: str):
     if updated:
         conn.commit()
     used_questions = fetchall_dicts(
-        cur.execute("SELECT questionId as id, questionTitle as title FROM session_questions WHERE sessionId=? ORDER BY position", (row["id"],))
+        cur.execute(
+            """
+            SELECT
+              questionId as id,
+              questionTitle as title,
+              q_type as qType,
+              code_task_id as codeTaskId
+            FROM session_questions
+            WHERE sessionId=?
+            ORDER BY position
+            """,
+            (row["id"],),
+        )
     )
     conn.close()
     return {
@@ -1342,7 +2054,20 @@ def change_language(payload: ChangeLanguagePayload):
 def get_used_questions(cur, session_id: str):
     return fetchall_dicts(
         cur.execute(
-            "SELECT questionId as id, questionTitle as title, q_type FROM session_questions WHERE sessionId=? ORDER BY position",
+            """
+            SELECT
+              questionId as id,
+              questionTitle as title,
+              q_type as qType,
+              code_task_id as codeTaskId,
+              position,
+              category,
+              status,
+              is_finished as isFinished
+            FROM session_questions
+            WHERE sessionId=?
+            ORDER BY position
+            """,
             (session_id,),
         )
     )
@@ -1503,56 +2228,72 @@ def eval_theory(payload: TheoryEvalPayload):
 
 @app.post("/api/anticheat/event")
 def add_anticheat_event(payload: AntiCheatEvent):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO interview_events (id, sessionId, ownerId, event_type, payload, risk_level, createdAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(uuid.uuid4()),
-            payload.sessionId,
-            payload.ownerId,
-            payload.eventType,
-            payload.payload,
-            payload.risk or "medium",
-            now_iso(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=3)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO interview_events (id, sessionId, ownerId, event_type, payload, risk_level, createdAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                payload.sessionId,
+                payload.ownerId,
+                payload.eventType,
+                payload.payload,
+                payload.risk or "medium",
+                now_iso(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return {"status": "ok"}
+    except sqlite3.OperationalError as exc:  # noqa: BLE001
+        logger.warning("anticheat event skipped due to db lock", extra={"err": str(exc)})
+        return {"status": "ignored"}
 
 
 @app.post("/api/interview/finish")
 def finish_interview(payload: FinishInterviewPayload):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM sessions WHERE id=?", (payload.sessionId,))
-    session = fetchone_dict(cur)
-    if not session:
-        conn.close()
-        return {"status": "missing"}
-    cur.execute("UPDATE sessions SET status='completed', is_active=0, is_finished=1 WHERE id=?", (payload.sessionId,))
-    finished_at = now_iso()
-    cur.execute(
-        "INSERT OR REPLACE INTO interview_results (id, sessionId, ownerId, status, finishedAt) VALUES (?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), payload.sessionId, payload.ownerId, "completed", finished_at),
-    )
-    # Чистим историю поддержки пользователя при завершении собеседования
-    if session.get("ownerId"):
-        cur.execute("DELETE FROM support_messages WHERE userId=?", (session.get("ownerId"),))
-        cur.execute("DELETE FROM support_dialogs WHERE userId=?", (session.get("ownerId"),))
-    # Обновляем назначенное интервью, если есть связь
-    if session.get("assignedId"):
-        cur.execute(
-            "UPDATE assigned_interviews SET status='completed', sessionId=? WHERE id=?",
-            (payload.sessionId, session.get("assignedId")),
-        )
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
+    last_err = None
+    for _ in range(3):
+        conn = None
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
+            conn.execute("PRAGMA busy_timeout=5000")
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM sessions WHERE id=?", (payload.sessionId,))
+            session = fetchone_dict(cur)
+            if not session:
+                return {"status": "missing"}
+            cur.execute("UPDATE sessions SET status='completed', is_active=0, is_finished=1 WHERE id=?", (payload.sessionId,))
+            finished_at = now_iso()
+            total_score = calculate_session_score(cur, payload.sessionId)
+            cur.execute(
+                "INSERT OR REPLACE INTO interview_results (id, sessionId, ownerId, status, finishedAt, score) VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), payload.sessionId, payload.ownerId, "completed", finished_at, total_score),
+            )
+            if session.get("ownerId"):
+                cur.execute("DELETE FROM support_messages WHERE userId=?", (session.get("ownerId"),))
+                cur.execute("DELETE FROM support_dialogs WHERE userId=?", (session.get("ownerId"),))
+            if session.get("assignedId"):
+                cur.execute(
+                    "UPDATE assigned_interviews SET status='completed', sessionId=? WHERE id=?",
+                    (payload.sessionId, session.get("assignedId")),
+                )
+            return {"status": "ok", "score": total_score}
+        except sqlite3.OperationalError as exc:  # noqa: BLE001
+            last_err = exc
+            time.sleep(0.3)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    logger.warning("finish_interview skipped due to db lock", extra={"err": str(last_err)})
+    raise HTTPException(status_code=500, detail="db_locked")
 
 
 @app.post("/api/session/finish")
@@ -1607,4 +2348,11 @@ if __name__ == "__main__":
     import uvicorn
 
     # Use full module path so running `python server_py/main.py` works reliably
-    uvicorn.run("server_py.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "server_py.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info",
+        log_config=uvicorn.config.LOGGING_CONFIG,  # вернём стандартный uvicorn-логгер
+    )

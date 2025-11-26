@@ -19,16 +19,28 @@ const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
 type Props = {
   sessionId?: string;
   questionId?: string;
+  starterCode?: string;
+  savedCode?: string;
   onHeavyPaste?: (len: number) => void;
-  onCodeChange?: () => void;
+  onCodeChange?: (value: string) => void;
   height?: number;
 };
 
-export const EditorPane = ({ sessionId, questionId, onHeavyPaste, onCodeChange, height = 600 }: Props) => {
+export const EditorPane = ({ sessionId, questionId, starterCode, savedCode, onHeavyPaste, onCodeChange, height = 600 }: Props) => {
   const { code, setCode } = useSessionStore();
   const user = useAuthStore((s) => s.user);
   const [ready, setReady] = useState(false);
   useEffect(() => setReady(true), []);
+
+  // Инициализация кода при первом открытии вопроса
+  useEffect(() => {
+    if (!questionId) return;
+    if (savedCode !== undefined && savedCode !== null && savedCode !== "") {
+      setCode(savedCode);
+    } else if (starterCode) {
+      setCode(starterCode);
+    }
+  }, [questionId, starterCode, savedCode, setCode]);
 
   return (
     <div className="flex h-full flex-col gap-2">
@@ -52,11 +64,15 @@ export const EditorPane = ({ sessionId, questionId, onHeavyPaste, onCodeChange, 
               editor.onDidChangeModelContent((e) => {
                 const largeInsert = e.changes?.some((c) => (c.text?.length ?? 0) > 500);
                 if (largeInsert && onHeavyPaste) onHeavyPaste(e.changes[0].text.length);
-                onCodeChange?.();
+                onCodeChange?.(editor.getValue());
               });
               return () => pasteListener?.dispose();
             }}
-            onChange={(value) => setCode(value ?? "")}
+            onChange={(value) => {
+              const val = value ?? "";
+              setCode(val);
+              onCodeChange?.(val);
+            }}
             options={{
               minimap: { enabled: false },
               fontSize: 14,

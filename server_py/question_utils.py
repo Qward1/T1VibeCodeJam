@@ -5,6 +5,7 @@ try:
     from db import fetchone_dict
 except Exception:
     from server_py.db import fetchone_dict  # type: ignore
+import uuid
 
 
 def normalize_task_types(tasks: List[str]) -> List[str]:
@@ -83,3 +84,101 @@ def collect_previous_theory_topics(cur, session_id: str) -> List[str]:
         seen.add(t)
         uniq.append(t)
     return uniq
+
+
+def collect_previous_code_topics(cur, session_id: str, track: str):
+    """
+    Собирает темы уже выданных кодовых задач для сессии и трека.
+    Возвращает (algo_topics, domain_topics) списками строк.
+    """
+    rows = cur.execute(
+        """
+        SELECT sq.category, sq.meta_json, sq.questionTitle, ct.topic, ct.title as ct_title, ct.track
+        FROM session_questions sq
+        LEFT JOIN code_tasks ct ON ct.task_id = sq.code_task_id
+        WHERE sq.sessionId=? AND sq.q_type='coding'
+        """,
+        (session_id,),
+    ).fetchall()
+    algo = []
+    domain = []
+    for cat, meta, qtitle, ctopic, ctitle, ctrack in rows:
+        # Если track не задан у задачи — считаем, что она относится к текущему треку
+        if ctrack and str(ctrack).lower() != str(track).lower():
+            continue
+        topic_val = ctopic or qtitle or ctitle
+        if not topic_val and meta:
+            try:
+                obj = json.loads(meta)
+                topic_val = obj.get("topic") or obj.get("title")
+            except Exception:
+                topic_val = None
+        if not topic_val:
+            continue
+        if (cat or "").lower() == "domain":
+            domain.append(str(topic_val))
+        else:
+            algo.append(str(topic_val))
+    # дедубликация с сохранением порядка
+    def dedup(items):
+        seen = set()
+        res = []
+        for t in items:
+            if t in seen:
+                continue
+            seen.add(t)
+            res.append(t)
+        return res
+    return dedup(algo), dedup(domain)
+
+
+def save_code_task_and_tests(cur, task_id: str, task: dict, public_tests: List[dict], hidden_tests: List[dict]):
+    """Сохраняет кодовую задачу и тесты в БД."""
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO code_tasks (task_id, track, level, category, language, allowed_languages_json, title, description_markdown, function_signature, starter_code, constraints_json, reference_solution, topic, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            task.get("track"),
+            task.get("level"),
+            task.get("category"),
+            task.get("language"),
+            json.dumps(task.get("allowed_languages") or [], ensure_ascii=False),
+            task.get("title"),
+            task.get("description_markdown"),
+            task.get("function_signature"),
+            task.get("starter_code"),
+            json.dumps(task.get("constraints") or [], ensure_ascii=False),
+            task.get("reference_solution"),
+            task.get("topic"),
+            json.dumps(task, ensure_ascii=False),
+        ),
+    )
+    for t in public_tests:
+        cur.execute(
+            """
+            INSERT INTO code_tests (task_id, name, is_public, input_json, expected_json)
+            VALUES (?, ?, 1, ?, ?)
+            """,
+            (
+                task_id,
+                t.get("name"),
+                json.dumps(t.get("input"), ensure_ascii=False),
+                json.dumps(t.get("expected"), ensure_ascii=False),
+            ),
+        )
+    for t in hidden_tests:
+        cur.execute(
+            """
+            INSERT INTO code_tests (task_id, name, is_public, input_json, expected_json)
+            VALUES (?, ?, 0, ?, ?)
+            """,
+            (
+                task_id,
+                t.get("name"),
+                json.dumps(t.get("input"), ensure_ascii=False),
+                json.dumps(t.get("expected"), ensure_ascii=False),
+            ),
+        )
