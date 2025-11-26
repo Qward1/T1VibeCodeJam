@@ -35,7 +35,7 @@ from llm_theory import (
     generate_theory_question,
     TheoryDecision,
 )
-from llm_code import generate_code_task, parse_function_name, build_tests_for_task
+from llm_code import generate_code_task, parse_function_name, build_tests_for_task, explain_code_error, generate_code_hint
 from question_utils import (
     pick_question,
     normalize_task_types,
@@ -140,6 +140,14 @@ class CheckCodePayload(BaseModel):
     ownerId: str
     code: str
     language: str
+
+class CodeHintPayload(BaseModel):
+    sessionId: str
+    questionId: str
+    taskId: str
+    ownerId: str
+    language: str
+    userCode: Optional[str] = None
 
 class SupportSendPayload(BaseModel):
     userId: str
@@ -315,6 +323,125 @@ def score_for_attempt(attempt: int, max_score: int = 10) -> int:
     if attempt == 3:
         return int(max_score * 0.5)
     return 0
+
+
+def _base_max_score(task: dict) -> int:
+    category = (task.get("category") or "").lower()
+    if category == "domain":
+        return 15
+    return 10
+
+
+def _get_hints_used(cur, session_id: str, question_id: str) -> int:
+    row = fetchone_dict(
+        cur.execute(
+            "SELECT hints_used FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1",
+            (session_id, question_id),
+        )
+    )
+    return int(row.get("hints_used") or 0) if row else 0
+
+
+def _bump_hints_used(cur, session_id: str, question_id: str) -> int:
+    cur.execute(
+        "UPDATE session_questions SET hints_used=COALESCE(hints_used,0)+1 WHERE sessionId=? AND questionId=?",
+        (session_id, question_id),
+    )
+    return _get_hints_used(cur, session_id, question_id)
+
+
+def _candidate_languages(task: dict, requested: Optional[str]) -> List[str]:
+    langs: List[str] = []
+    if requested:
+        langs.append(requested.lower())
+    try:
+        allowed = json.loads(task.get("allowed_languages_json") or "[]")
+        if isinstance(allowed, list):
+            for l in allowed:
+                if isinstance(l, str):
+                    ll = l.lower()
+                    if ll not in langs:
+                        langs.append(ll)
+    except Exception:
+        pass
+    if task.get("language"):
+        ll = str(task.get("language")).lower()
+        if ll not in langs:
+            langs.append(ll)
+    return langs or [requested or "python"]
+
+
+@app.post("/api/code/hint")
+def code_hint(payload: CodeHintPayload):
+    conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+    cur = conn.cursor()
+    try:
+        task_id = _resolve_task_id(cur, payload.sessionId, payload.questionId, payload.taskId)
+        if not task_id:
+            raise HTTPException(status_code=404, detail="task_not_found")
+        task, _, _ = _load_task_and_tests(cur, task_id, payload.sessionId, payload.questionId)
+        # Берём код из запроса или последней попытки
+        user_code = payload.userCode
+        if not user_code:
+            row = fetchone_dict(
+                cur.execute(
+                    """
+                    SELECT code FROM code_attempts
+                    WHERE session_id=? AND question_id=? AND task_id=?
+                    ORDER BY attempt_number DESC LIMIT 1
+                    """,
+                    (payload.sessionId, payload.questionId, task_id),
+                )
+            )
+            user_code = row.get("code") if row else None
+        hints_used_before = _get_hints_used(cur, payload.sessionId, payload.questionId)
+        hint_level = hints_used_before + 1
+        if hint_level > 3:
+            return {"hint": None, "hintsUsed": hints_used_before, "effectiveMaxScore": max(_base_max_score(task) - hints_used_before * 2, 0)}
+        prev_rows = fetchall_dicts(
+            cur.execute(
+                """
+                SELECT content FROM messages
+                WHERE sessionId=? AND questionId=? AND source='hint'
+                ORDER BY datetime(createdAt) ASC
+                """,
+                (payload.sessionId, payload.questionId),
+            )
+        )
+        prev_hints = [r.get("content") for r in prev_rows if r.get("content")]
+        hint_text = generate_code_hint(task, user_code, hint_level, prev_hints)
+        hints_used = _bump_hints_used(cur, payload.sessionId, payload.questionId)
+        base_max = _base_max_score(task)
+        effective_max = max(base_max - hints_used_before * 2, 0)
+        if hint_text:
+            cur.execute(
+                """
+                INSERT INTO messages (id, sessionId, questionId, ownerId, role, content, source, createdAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    payload.sessionId,
+                    payload.questionId,
+                    payload.ownerId,
+                    "assistant",
+                    hint_text,
+                    "hint",
+                    now_iso(),
+                ),
+            )
+        conn.commit()
+        return {"hint": hint_text, "hintsUsed": hints_used, "effectiveMaxScore": effective_max}
+    finally:
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        conn.close()
 
 
 def choose_next_category(cur, session_id: str, track: str) -> Optional[str]:
@@ -1190,6 +1317,18 @@ def _tests_from_runner(run_result: dict) -> List[dict]:
     return out
 
 
+def _save_error_hint(cur, session_id: str, question_id: str, owner_id: str, hint: str):
+    if not hint:
+        return
+    cur.execute(
+        """
+        INSERT INTO messages (id, sessionId, ownerId, role, content, source, questionId)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (str(uuid.uuid4()), session_id, owner_id, "assistant", hint, "code_error_hint", question_id),
+    )
+
+
 def _save_attempt(cur, payload: CheckCodePayload, attempt: int, code: str, passed_public: int, passed_hidden: int, score: int, task_id: Optional[str] = None):
     params = (
         payload.sessionId,
@@ -1242,16 +1381,41 @@ def code_run_samples(payload: RunSamplesPayload):
             return {"tests": [], "hasError": True, "error": "function_not_found"}
         param_count = _param_count(signature)
         runner_tests = _prepare_runner_tests(public_tests, param_count)
-        try:
-            run_result = run_code_with_fallback(payload.language, payload.code, function_name, runner_tests)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("run-samples docker failed", extra={"task_id": payload.taskId})
-            return {"tests": [], "hasError": True, "error": str(exc)}
+        run_result = None
+        last_error = None
+        chosen_lang = payload.language
+        for lang in _candidate_languages(task, payload.language):
+            try:
+                tmp_res = run_code_with_fallback(lang, payload.code, function_name, runner_tests)
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                continue
+            has_error, err_msg = _runner_has_error(tmp_res)
+            if not has_error:
+                run_result = tmp_res
+                chosen_lang = lang
+                break
+            last_error = err_msg
+            run_result = tmp_res
+        if run_result is None:
+            hint = explain_code_error(payload.language, signature, payload.code, last_error or "runtime_error") if signature else None
+            if hint:
+                _save_error_hint(cur, payload.sessionId, payload.questionId, payload.ownerId, hint)
+            conn.commit()
+            return {"tests": [], "hasError": True, "error": last_error or "runtime_error"}
         has_error, err_msg = _runner_has_error(run_result)
         if has_error:
+            hint = explain_code_error(chosen_lang, signature, payload.code, err_msg) if signature else None
+            if hint:
+                _save_error_hint(cur, payload.sessionId, payload.questionId, payload.ownerId, hint)
+            conn.commit()
             return {"tests": _tests_from_runner(run_result), "hasError": True, "error": err_msg or "runtime_error"}
         return {"tests": _tests_from_runner(run_result), "hasError": False, "error": None}
     finally:
+        try:
+            conn.commit()
+        except Exception:
+            pass
         conn.close()
 
 
@@ -1275,6 +1439,10 @@ def code_check(payload: CheckCodePayload):
             raise HTTPException(status_code=400, detail="function_not_found")
         param_count = _param_count(signature)
         runner_public = _prepare_runner_tests(public_tests, param_count)
+        lang_candidates = _candidate_languages(task, payload.language)
+        hints_used = _get_hints_used(cur, payload.sessionId, payload.questionId)
+        base_max = _base_max_score(task)
+        effective_max = max(base_max - hints_used * 2, 0)
         cur.execute(
             """
             SELECT COALESCE(MAX(attempt_number), 0) AS max_attempt
@@ -1289,35 +1457,57 @@ def code_check(payload: CheckCodePayload):
         finished = False
         next_question = None
         response: dict = {}
-        try:
-            public_result = run_code_with_fallback(payload.language, payload.code, function_name, runner_public)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("code check docker error (public)", extra={"task_id": payload.taskId})
+        public_result = None
+        chosen_lang = lang_candidates[0]
+        last_err = None
+        public_tests_resp: list[dict] = []
+        for lang in lang_candidates:
+            try:
+                tmp = run_code_with_fallback(lang, payload.code, function_name, runner_public)
+            except Exception as exc:  # noqa: BLE001
+                last_err = str(exc)
+                continue
+            has_error_public, err_msg = _runner_has_error(tmp)
+            public_tests_resp = _tests_from_runner(tmp)
+            if not has_error_public:
+                public_result = tmp
+                chosen_lang = lang
+                break
+            last_err = err_msg
+            public_result = tmp
+        if public_result is None:
             _save_attempt(cur, payload, attempt, payload.code, 0, 0, 0, task_id)
+            hint = explain_code_error(payload.language, signature, payload.code, last_err or "runtime_error") if signature else None
+            if hint:
+                _save_error_hint(cur, payload.sessionId, payload.questionId, payload.ownerId, hint)
             response = {
                 "solved": False,
                 "attempt": attempt,
                 "score": 0,
-                "maxScore": 10,
-                "publicTests": [{"name": "runtime", "status": "error", "expected": None, "actual": str(exc)}],
+                "maxScore": effective_max,
+                "publicTests": [{"name": "runtime", "status": "error", "expected": None, "actual": last_err or "error"}],
                 "hiddenPassed": False,
                 "hasError": True,
                 "error": "docker_unavailable",
+                "hintsUsed": hints_used,
             }
         else:
             has_error_public, err_msg = _runner_has_error(public_result)
-            public_tests_resp = _tests_from_runner(public_result)
             if has_error_public:
                 _save_attempt(cur, payload, attempt, payload.code, 0, 0, 0, task_id)
+                hint = explain_code_error(chosen_lang, signature, payload.code, err_msg) if signature else None
+                if hint:
+                    _save_error_hint(cur, payload.sessionId, payload.questionId, payload.ownerId, hint)
                 response = {
                     "solved": False,
                     "attempt": attempt,
                     "score": 0,
-                    "maxScore": 10,
+                    "maxScore": effective_max,
                     "publicTests": [{"name": "runtime", "status": "error", "expected": None, "actual": err_msg or "error"}],
                     "hiddenPassed": False,
                     "hasError": True,
                     "error": err_msg or "runtime_error",
+                    "hintsUsed": hints_used,
                 }
             else:
                 public_all_passed = all(t.get("status") == "passed" for t in public_tests_resp)
@@ -1327,27 +1517,45 @@ def code_check(payload: CheckCodePayload):
                         "solved": False,
                         "attempt": attempt,
                         "score": 0,
-                        "maxScore": 10,
+                        "maxScore": effective_max,
                         "publicTests": public_tests_resp,
                         "hiddenPassed": False,
                         "hasError": False,
+                        "hintsUsed": hints_used,
                     }
                 else:
                     runner_hidden = _prepare_runner_tests(hidden_tests, param_count)
-                    try:
-                        hidden_result = run_code_with_fallback(payload.language, payload.code, function_name, runner_hidden)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("code check docker error (hidden)", extra={"task_id": payload.taskId})
+                    hidden_result = None
+                    last_hidden_err = None
+                    for lang in lang_candidates:
+                        try:
+                            tmp_hid = run_code_with_fallback(lang, payload.code, function_name, runner_hidden)
+                        except Exception as exc:  # noqa: BLE001
+                            last_hidden_err = str(exc)
+                            continue
+                        has_error_hidden, err_h = _runner_has_error(tmp_hid)
+                        hidden_tests_resp = _tests_from_runner(tmp_hid)
+                        if not has_error_hidden:
+                            hidden_result = tmp_hid
+                            chosen_lang = lang
+                            break
+                        last_hidden_err = err_h
+                        hidden_result = tmp_hid
+                    if hidden_result is None:
                         _save_attempt(cur, payload, attempt, payload.code, 1, 0, 0, task_id)
+                        hint = explain_code_error(payload.language, signature, payload.code, last_hidden_err or "runtime_error") if signature else None
+                        if hint:
+                            _save_error_hint(cur, payload.sessionId, payload.questionId, payload.ownerId, hint)
                         response = {
                             "solved": False,
                             "attempt": attempt,
                             "score": 0,
-                            "maxScore": 10,
+                            "maxScore": effective_max,
                             "publicTests": public_tests_resp,
                             "hiddenPassed": False,
                             "hasError": True,
-                            "error": str(exc),
+                            "error": last_hidden_err or "runtime_error",
+                            "hintsUsed": hints_used,
                         }
                     else:
                         has_error_hidden, _ = _runner_has_error(hidden_result)
@@ -1355,28 +1563,33 @@ def code_check(payload: CheckCodePayload):
                         hidden_passed = not has_error_hidden and all(t.get("status") == "passed" for t in hidden_tests_resp)
                         if not hidden_passed:
                             _save_attempt(cur, payload, attempt, payload.code, 1, 0, 0, task_id)
+                            hint = explain_code_error(chosen_lang, signature, payload.code, "hidden tests failed") if signature else None
+                            if hint:
+                                _save_error_hint(cur, payload.sessionId, payload.questionId, payload.ownerId, hint)
                             response = {
                                 "solved": False,
                                 "attempt": attempt,
                                 "score": 0,
-                                "maxScore": 10,
+                                "maxScore": effective_max,
                                 "publicTests": public_tests_resp,
                                 "hiddenPassed": False,
                                 "hasError": has_error_hidden,
                                 "error": "runtime_error" if has_error_hidden else None,
+                                "hintsUsed": hints_used,
                             }
                         else:
-                            score = score_for_attempt(attempt, 10)
+                            score = score_for_attempt(attempt, effective_max)
                             _save_attempt(cur, payload, attempt, payload.code, 1, 1, score, task_id)
                             response = {
                                 "solved": True,
                                 "attempt": attempt,
                                 "score": score,
-                                "maxScore": 10,
+                                "maxScore": effective_max,
                                 "publicTests": public_tests_resp,
                                 "hiddenPassed": True,
                                 "hasError": False,
                                 "error": None,
+                                "hintsUsed": hints_used,
                             }
                             finished = True
 

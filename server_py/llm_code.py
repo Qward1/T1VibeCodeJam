@@ -16,6 +16,114 @@ except Exception:
     from llm_theory import extract_json  # type: ignore
 
 logger = logging.getLogger(__name__)
+ERROR_MENTOR_SYSTEM = """
+/no_think Ты — доброжелательный ментор по программированию.
+
+Твоя задача:
+- по коду пользователя и тексту ошибки кратко объяснить, в чём суть проблемы,
+- мягко направить пользователя в сторону верного решения,
+- НЕ давать готового полного решения и НЕ переписывать всю функцию за него.
+
+Требования:
+- Пиши на русском языке.
+- Объясняй простыми словами (2–5 предложений).
+- Не раскрывай полный правильный код.
+- Не используй фразы вида 'вот исправленное решение', 'замени весь код на...' и т.п.
+- Даём только направление: на что обратить внимание (индексы, границы циклов, типы данных, граничные случаи, пустые входы и т.д.).
+"""
+
+SYSTEM_PROMPT_CODE_HINT = """
+/no_think Ты — доброжелательный ментор по программированию на техническом собеседовании.
+
+Твоя задача:
+- давать кандидату подсказки по кодовой задаче,
+- каждая следующая подсказка должна раскрывать ЧУТЬ БОЛЬШЕ информации, чем предыдущая,
+- НИКОГДА не давать готовое решение и не писать полный код функции.
+
+Подсказки делятся на уровни:
+
+Уровень 1 (первая подсказка):
+- Очень общий намёк.
+- Помоги кандидату понять, в каком направлении думать: какой тип задачи, какая структура данных или приём может пригодиться.
+- НЕ называй конкретный алгоритм, если это возможно, и НЕ описывай пошаговое решение.
+
+Уровень 2 (вторая подсказка):
+- Более конкретное направление.
+- Можно назвать подходящий алгоритм или структуру данных (например, 'скользящее окно', 'хэш-таблица', 'двойной проход').
+- Можно указать, какие ключевые случаи/граничные условия нужно учесть.
+- НЕ расписывай алгоритм по шагам и НЕ давай подробный псевдокод.
+
+Уровень 3 (третья и последующие подсказки):
+- Более детальный разбор.
+- Можно описать общую структуру решения: какие шаги должны идти в каком порядке (без полного кода).
+- Можно указать, где именно в текущем решении кандидата ошибка (логика, индексы, условия).
+- НЕЛЬЗЯ писать полный рабочий код или такой псевдокод, который можно просто переписать и получить готовое решение.
+
+Общие требования для всех уровней:
+- Пиши на русском языке.
+- Подсказка должна быть короткой (2–6 предложений).
+- Нельзя давать полный код решения или детальный алгоритм 'сделай X, потом Y, потом Z' до уровня прямого рецепта.
+- Если переданы предыдущие подсказки, НЕ повторяй их дословно, а дополняй новыми деталями.
+"""
+
+
+def build_user_prompt_code_error(language: str, function_signature: str, user_code: str, error_text: str) -> str:
+    return f"""
+Проанализируй ошибку в коде.
+
+Язык: {language}
+Сигнатура функции: {function_signature}
+
+Код пользователя:
+```{language}
+{user_code}
+```
+
+Текст ошибки/traceback:
+{error_text}
+
+Объясни кратко, в чём проблема, и подскажи, что нужно проверить или поправить, но не давай готового решения и не пиши полный исправленный код.
+"""
+
+
+def build_user_prompt_code_hint(task: dict, user_code: Optional[str], hint_level: int, previous_hints: Optional[List[str]] = None) -> str:
+    base = f"""
+Задача для собеседования (кодовая):
+
+Заголовок: {task.get("title")}
+Направление (track): {task.get("track")}
+Уровень (level): {task.get("level")}
+Категория (category): {task.get("category")}
+Сигнатура функции: {task.get("function_signature")}
+
+Условие задачи (Markdown):
+{task.get("description_markdown")}
+
+Текущий уровень подсказки: {hint_level}.
+"""
+    if previous_hints:
+        joined = "\n- ".join(previous_hints)
+        base += f"""
+
+Ранее кандидату уже были даны такие подсказки (их НЕЛЬЗЯ повторять, нужно ДОПОЛНИТЬ информацию):
+- {joined}
+"""
+    if user_code:
+        base += f"""
+
+Текущий код кандидата (может быть частичным или неправильным):
+```{task.get("language", "python")}
+{user_code}
+```
+
+Дай короткую подсказку, которая поможет кандидату продвинуться, но НЕ раскрывай готовое решение и не пиши полный код.
+"""
+    else:
+        base += """
+
+Кандидат пока не написал код или только начинает. Дай короткую подсказку, которая мягко направит его, но НЕ раскрывай готовое решение и не пиши полный код.
+"""
+    return base
 
 SYSTEM_PROMPT_GENERATE_CODE_TASK = """
 /no_think Ты — генератор задач по программированию для технических собеседований.
@@ -234,6 +342,44 @@ def generate_code_task(
     except Exception as exc:  # noqa: BLE001
         logger.exception("LLM code task generation failed, using fallback", extra={"track": track, "level": level, "category": category, "error": str(exc)})
         return _fallback_code_task(track, level, category, language)
+
+
+def explain_code_error(language: str, function_signature: str, user_code: str, error_text: str) -> Optional[str]:
+    """LLM-подсказка по ошибке исполнения кода пользователя."""
+    try:
+        raw = chat_completion(
+            model="qwen3-coder-30b-a3b-instruct-fp8",
+            messages=[
+                {"role": "system", "content": ERROR_MENTOR_SYSTEM},
+                {"role": "user", "content": build_user_prompt_code_error(language, function_signature, user_code, error_text)},
+            ],
+            temperature=0.2,
+            max_tokens=300,
+        )
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("code error mentor failed", extra={"error": str(exc)})
+    return None
+
+
+def generate_code_hint(task: dict, user_code: Optional[str], hint_level: int, previous_hints: Optional[List[str]] = None) -> Optional[str]:
+    """LLM-подсказка по задаче без раскрытия решения."""
+    try:
+        raw = chat_completion(
+            model="qwen3-coder-30b-a3b-instruct-fp8",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_CODE_HINT},
+                {"role": "user", "content": build_user_prompt_code_hint(task, user_code, hint_level, previous_hints)},
+            ],
+            temperature=0.3,
+            max_tokens=320,
+        )
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("code hint failed", extra={"error": str(exc)})
+    return None
 
 
 def _fallback_code_task(track: str, level: str, category: str, language: str) -> dict:

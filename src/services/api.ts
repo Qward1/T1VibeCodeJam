@@ -779,6 +779,22 @@ export const api = {
     });
   },
 
+  async codeHint(params: { sessionId: string; questionId: string; taskId: string; language: string; ownerId?: string; userCode?: string }): Promise<{ hint: string | null; hintsUsed: number; effectiveMaxScore: number }> {
+    if (useBackend && API_BASE) {
+      const ownerId = params.ownerId || activeUser?.id;
+      if (!ownerId) throw new Error("NO_ACTIVE_USER");
+      return call(`/api/code/hint`, {
+        method: "POST",
+        body: JSON.stringify({ ...params, ownerId }),
+      });
+    }
+    return withDelay({
+      hint: "Подумайте о граничных случаях и проверьте работу с пустыми входами.",
+      hintsUsed: 1,
+      effectiveMaxScore: 8,
+    });
+  },
+
   async getReport(id: string): Promise<InterviewReport> {
     if (useBackend && API_BASE) {
       const { report } = await call<{ report: InterviewReport }>(`/api/report/${id}`);

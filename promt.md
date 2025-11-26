@@ -1,590 +1,417 @@
-Подзадача 0. Общие требования и смена логики показа редактора
+1. Какие данные у тебя уже есть от LLM
 
-Перестань использовать колонку useIDE из таблицы questions для решения, показывать ли редактор кода.
+Учитывай, что:
 
-Сделай так, чтобы вывод редактора на экран собеседования теперь определялся по колонке q_type из таблицы session_questions:
+Теория — генерация вопроса
 
-если session_questions.q_type = 'coding' → показывать редактор кода;
-
-если q_type = 'theory' → показывать только текстовое поле / чат без код-редактора;
-
-остальные типы (system, info, и т.п.) при необходимости обработать по умолчанию (без редактора).
-
-Пройди по всем местам в коде, где сейчас логика опирается на useIDE (например, при формировании ответа /api/interview/next или /api/session/...) и замени её на проверку q_type из session_questions.
-
-Подзадача 1. Формат LLM-задачи по коду
-
-Реализуй генерацию задач по коду через LLM в следующем формате JSON:
+LLM уже отдаёт примерно такой JSON:
 
 {
-  "task_id": "backend_middle_algo_001",
-  "title": "Максимальная сумма подмассива",
-  "description_markdown": "Текст условия в Markdown на русском...",
+  "question": "Объясните, как вы реализуете атомарность...",
   "track": "backend",
   "level": "middle",
-  "category": "algo",
-  "language": "python",
-  "allowed_languages": ["python", "javascript"],
-  "function_signature": "def max_subarray_sum(arr: list[int]) -> int:",
-  "starter_code": "def max_subarray_sum(arr: list[int]) -> int:\n    # TODO: реализуйте алгоритм\n    pass",
-  "constraints": [
-    "Массив может содержать от 1 до 10^5 элементов",
-    "Элементы массива могут быть от -10^4 до 10^4"
+  "estimated_answer_time_min": 3,
+  "key_points": [
+    "Понимание принципа атомарности и транзакций",
+    "Использование механизмов компенсации или idempotency",
+    "Пример реализации (например, Saga)",
+    "Как избежать несогласованности при частичных сбоях"
   ],
-  "reference_solution": "def max_subarray_sum(...):\n    ...",
-  "sample_inputs": [
-    { "name": "пример_1", "input": [[-2, 1, -3, 4, -1, 2, 1, -5, 4]] }
-  ],
-  "edge_case_inputs": [
-    { "name": "крайний_случай_1", "input": [[-1, -2, -3]] }
-  ],
-  "topic": "алгоритм Кадане, максимальная сумма подмассива"
+  "max_score": 10
 }
 
+Теория — оценка ответа
 
-Обрати внимание:
-
-sample_inputs и edge_case_inputs содержат только входы (input), без expected.
-
-starter_code — каркас функции/класса, который компилируется, но ещё не решает задачу.
-
-reference_solution — корректное эталонное решение, которое будет использовано только на сервере для генерации тестов.
-
-Подзадача 2. Промты и клиент для генерации задач по коду
-2.1. Клиент LLM (если ещё не сделан)
-
-Используй существующий llm_client.py (или создай его, если ещё нет) с обёрткой chat_completion.
-
-2.2. System-промт для генерации задач по коду
-
-Добавь в модуль, например llm_code.py, константу:
-
-SYSTEM_PROMPT_GENERATE_CODE_TASK = """
-/no_think Ты — генератор задач по программированию для технических собеседований.
-
-Твоя задача:
-- сгенерировать ОДНУ задачу по коду в формате JSON,
-- сделать её выполнимой за 10–25 минут для кандидата указанного уровня,
-- выдать краткий заголовок (title),
-- сформировать каркас решения (starter_code) для редактора,
-- выдать эталонное решение (reference_solution),
-- предложить набор входных данных для открытых и скрытых тестов (БЕЗ ожидаемых результатов).
-
-ОБЯЗАТЕЛЬНАЯ структура ответа:
-Ты ДОЛЖЕН вернуть СТРОГО один JSON-объект следующего вида
-(ключи и типы полей должны совпадать):
+LLM даёт:
 
 {
-  "task_id": "строка id задачи",
-  "title": "краткий заголовок до 8 слов",
-  "description_markdown": "подробное описание задачи в Markdown на русском",
-  "track": "frontend | backend | ds | ml | fullstack",
-  "level": "junior | middle | senior",
-  "category": "algo" | "domain",
-  "language": "python | javascript | ...",
-  "allowed_languages": ["python", "javascript"],
-
-  "function_signature": "строка сигнатуры, например: def solve(arr: list[int]) -> int:",
-  "starter_code": "каркас функции/класса с TODO/пустым телом, который можно вставить в редактор",
-  "constraints": [
-    "список читаемых ограничений на входные данные"
-  ],
-
-  "reference_solution": "полный код решения на указанном языке одной строкой (с \\n внутри)",
-
-  "sample_inputs": [
-    {
-      "name": "пример_1",
-      "input": [ <аргументы функции в виде JSON-значений> ]
-    }
-  ],
-  "edge_case_inputs": [
-    {
-      "name": "крайний_случай_1",
-      "input": [ ... ]
-    }
-  ],
-  "topic": "краткое текстовое описание темы задачи, например 'скользящее окно и подмассивы'"
+  "score": 4,
+  "max_score": 10,
+  "verdict": "partial",  // incorrect | partial | good | excellent
+  "covered_points": [...],
+  "missing_points": [...],
+  "feedback_short": "Ответ частично охватывает тему...",
+  "feedback_detailed": "Кандидат упомянул..., но не рассказал про...",
+  "suggested_next_difficulty": "same"  // decrease | same | increase
 }
 
-СТРОГИЕ ограничения:
-- Разрешено использовать ТОЛЬКО перечисленные выше поля.
-- НЕЛЬЗЯ добавлять поля: input, output, explanation, hint, difficulty или любые другие.
-- Поле description_markdown должно содержать полное условие задачи (можно с примером) на русском.
-- Поле starter_code должно быть компилируемым каркасом: правильный синтаксис, но тело решения не реализовано (например, pass или TODO).
-- Поле reference_solution должно содержать полностью рабочее решение, которое проходит все описанные тесты.
-- Поля sample_inputs и edge_case_inputs должны содержать ТОЛЬКО входные данные (input), без ожидаемых ответов.
-- Аргументы в input должны строго соответствовать сигнатуре функции по порядку.
+Код — генерация задачи
 
-Требования к сложности:
-- Задача должна решаться за время O(n) или O(n log n), если иное не оговорено в описании.
-- Не используй внешние библиотеки, только стандартный язык.
+LLM даёт:
 
-Формат ответа:
-- Верни СТРОГО один JSON-объект без пояснений, без комментариев и без Markdown-обёрток.
-- Не оборачивай JSON в ```json или другие кавычки.
-"""
+{
+  "task_id": "...",
+  "title": "...",
+  "description_markdown": "...",
+  "track": "backend",
+  "level": "middle",
+  "category": "algo" | "domain",
+  "language": "python",
+  "function_signature": "...",
+  "starter_code": "...",
+  "reference_solution": "...",
+  "sample_inputs": [...],
+  "edge_case_inputs": [...],
+  "topic": "алгоритм Кадане, ..."
+}
 
-2.3. User-промт генерации задачи
+Код — оценка решения
 
-Добавь функцию:
-
-def build_user_prompt_generate_code_task(track, level, category, language, previous_topics=None):
-    track_hint = {
-        "backend": """
-Направление: backend.
-- Для category = "algo": классические алгоритмы и структуры данных (массивы, строки, хэш-таблицы, очереди, стеки, деревья, графы, поиск, сортировка).
-- Для category = "domain": задачи, связанные с обработкой строк, JSON, логов, HTTP-параметров, простых запросов к псевдо-БД (без реальных сетевых вызовов и фреймворков).
-""",
-        "frontend": """
-Направление: frontend.
-- Для category = "algo": задачи на работу со строками, массивами, форматированием данных.
-- Для category = "domain": задачи на обработку данных, которые типично приходят во фронтенд (JSON, формы, валидация, простые трансформации перед отправкой на сервер).
-""",
-        "ds": """
-Направление: Data Science.
-- Для category = "algo": алгоритмы обработки массивов и матриц, сортировки, базовые статистические вычисления.
-- Для category = "domain": задачи на агрегацию и фильтрацию данных, вычисление статистик (среднее, медиана, квантили), подготовку признаков.
-""",
-        "ml": """
-Направление: Machine Learning.
-- Для category = "algo": функции работы с векторами и матрицами, вычисление метрик (accuracy, precision, recall, F1 и т.п.).
-- Для category = "domain": задачи на расчёт метрик качества, разбиение выборки на train/val/test, простые пред- и пост-обработки предсказаний.
-""",
-        "fullstack": """
-Направление: fullstack.
-- Для category = "algo": универсальные алгоритмические задачи (строки, массивы, графы, динамическое программирование).
-- Для category = "domain": задачи, сочетающие обработку данных, простую бизнес-логику и подготовку результата, который мог бы быть возвращён из API или отображён во фронтенде.
-"""
-    }.get(track, "")
-
-    prev_block = ""
-    if previous_topics:
-        joined = "\n- ".join(previous_topics)
-        prev_block = f"""
-Ранее в этой сессии уже были задачи на темы (их НЕЛЬЗЯ повторять):
-- {joined}
-"""
-
-    return f"""Сгенерируй одну задачу по программированию.
-
-Параметры:
-- направление (track): {track}
-- уровень (level): {level}
-- категория (category): {category}
-- язык реализации (language): {language}
-
-Контекст направления:
-{track_hint}
-{prev_block}
-
-Требования к задаче:
-- Задача должна быть решаема за ~10–25 минут.
-- Не должна быть тривиальной (не 'сумма двух чисел').
-- Для category = "algo": сосредоточься на алгоритмах и структурах данных.
-- Для category = "domain": сосредоточься на задачах, типичных для данного направления в реальной разработке.
-- Используй один основной вход (или несколько аргументов) и один возвращаемый результат.
-
-Верни только ОДИН JSON-объект в формате, описанном в system-подсказке."""
-
-2.4. Функция генерации задачи
-
-Добавь функцию:
-
-from .llm_client import chat_completion
-from .llm_theory import extract_json  # если утилита уже есть
-
-def generate_code_task(track: str, level: str, category: str, language: str, previous_topics=None) -> dict:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_GENERATE_CODE_TASK},
-        {"role": "user", "content": build_user_prompt_generate_code_task(track, level, category, language, previous_topics)},
-    ]
-    raw = chat_completion(
-        model="qwen3-coder-30b-a3b-instruct-fp8",
-        messages=messages,
-        temperature=0.4,
-        max_tokens=2000,
-    )
-    data = extract_json(raw)
-    return data
-
-Подзадача 3. Распределение тем задач и интеграция с интервью
-
-Введи поле category в логике интервью для кодинга: "algo" и "domain".
-
-Для backend реализуй паттерн распределения на интервью из 4 задач:
-
-def choose_code_category(track: str, index: int) -> str:
-    if track == "backend":
-        pattern = ["algo", "domain", "algo", "domain"]
-        return pattern[index % len(pattern)]
-    # можно добавить паттерны для других треков
-    return "algo"
-
-
-В логике формирования списка вопросов для сессии (при старте интервью или при выдаче следующего вопроса) добавь ветку для q_type = 'coding', где:
-
-выбирается category = choose_code_category(track, index),
-
-вызывается generate_code_task(...),
-
-результат сохраняется в БД.
-
-Подзадача 4. Сохранение задач и тестов в БД
-4.1. Таблицы
-
-Добавь/обнови таблицы (через миграцию или чистый SQL):
-
-code_tasks:
-
-id INTEGER PK,
-
-task_id TEXT UNIQUE,
-
-track TEXT,
-
-level TEXT,
-
-category TEXT,
-
-language TEXT,
-
-allowed_languages_json TEXT,
-
-title TEXT,
-
-description_markdown TEXT,
-
-function_signature TEXT,
-
-starter_code TEXT,
-
-constraints_json TEXT,
-
-reference_solution TEXT,
-
-topic TEXT,
-
-raw_json TEXT.
-
-code_tests:
-
-id INTEGER PK,
-
-task_id TEXT,
-
-name TEXT,
-
-is_public INTEGER, -- 1 для открытых тестов, 0 для скрытых
-
-input_json TEXT,
-
-expected_json TEXT.
+Это уже не LLM, а твоя логика:
 
 code_attempts:
 
-id INTEGER PK,
+attempt_number,
 
-session_id TEXT,
+passed_public, passed_hidden,
 
-question_id TEXT,
+score, max_score,
 
-task_id TEXT,
+time_spent,
 
-owner_id TEXT,
+hints_used,
 
-attempt_number INTEGER,
+кол-во ошибок исполнения.
 
-code TEXT,
+Плюс LLM-подсказки:
 
-passed_public INTEGER,
+текст подсказок (hint_level 1/2/3),
 
-passed_hidden INTEGER,
+объяснения ошибок (ментор по исключениям).
 
-score INTEGER,
+2. Нормализуй всё в единую модель для отчёта
 
-created_at DATETIME.
+Реализуй модуль, который после завершения собеседования собирает сырые данные и переводит их в унифицированный формат, не зависящий от конкретного LLM.
 
-4.2. Генерация expected-результатов из reference_solution
+2.1. Структура нормализованного вопроса в отчёте
+{
+  "question_id": "uuid",
+  "order": 1,
+  "q_type": "theory",      // theory | coding
+  "track": "backend",
+  "level": "middle",
+
+  "title": "Кеширование в backend",
+  "category": "algo" | "domain" | null,
+
+  "raw_prompt": "...",     // опционально
+  "raw_llm_question": {...},   // JSON от генерации (для debug)
+
+  "metrics": {
+    // общие
+    "time_spent_sec": 180,
+    "started_at": "...",
+    "finished_at": "...",
+
+    // теория
+    "score": 8,
+    "max_score": 10,
+    "score_ratio": 0.8,
+    "verdict": "good",
+    "key_points": [
+      {
+        "text": "Использование in-memory кэша",
+        "status": "covered"      // covered | missing | partial
+      },
+      {
+        "text": "Стратегия TTL / LRU",
+        "status": "missing"
+      }
+    ],
+    "llm_feedback_short": "...",
+    "llm_feedback_detailed": "...",
+
+    // код
+    "attempts": 2,
+    "score_code": 7,
+    "max_score_code": 10,
+    "score_ratio_code": 0.7,
+    "public_tests_total": 5,
+    "public_tests_passed": 5,
+    "hidden_tests_total": 5,
+    "hidden_tests_passed": 4,
+    "hints_used": 1,
+    "errors_count": 2,
+    "first_success_attempt": 2
+  },
+
+  "llm_evaluation": { ... },       // исходный JSON оценки теории
+  "code_task": { ... },            // исходный JSON задачи по коду
+  "code_attempts": [ ... ],        // массив попыток
+  "hints": [ ... ],                // тексты подсказок
+  "error_explanations": [ ... ]    // объяснения ошибок от LLM
+}
+
+
+Сделай функцию:
+
+def build_normalized_question_report(session_id: str, question_id: str) -> dict:
+    ...
+
+
+Она:
+
+для q_type = 'theory':
+
+берёт question JSON и evaluation JSON,
+
+мапит key_points + covered_points + missing_points → статусы,
+
+считает score_ratio,
+
+для q_type = 'coding':
+
+собирает все code_attempts,
+
+считает:
+
+attempts,
+
+final_score, max_score, score_ratio,
+
+hints_used (из отдельного поля или попыток),
+
+статистику тестов,
+
+first_success_attempt (если есть).
+
+3. Сводные метрики по собеседованию
 
 Реализуй функцию:
 
-def build_tests_for_task(task: dict) -> tuple[list[dict], list[dict]]:
-    """
-    На основе sample_inputs и edge_case_inputs вызывает reference_solution в Docker
-    и возвращает (public_tests, hidden_tests) с полями name, input, expected.
-    """
+def build_session_metrics(session_id: str) -> dict:
+    questions = [build_normalized_question_report(session_id, qid) for qid in ...]
+    ...
 
 
-Алгоритм:
-
-Собери all_inputs = sample_inputs + edge_case_inputs.
-
-Для каждого элемента:
-
-запусти reference_solution в Docker-контейнере (по task["language"]),
-
-передай аргументы из input в функцию,
-
-получи expected (сериализуй в JSON).
-
-public_tests — те, что соответствуют sample_inputs, hidden_tests — edge_case_inputs.
-
-Сохрани тесты в code_tests с флагом is_public.
-
-Подзадача 5. Замена выдачи задач на код
-
-В эндпоинте, отвечающем за выдачу следующего вопроса (/api/interview/next или аналог), замени логику кодинговых задач, которая сейчас берёт вопросы из таблицы questions, на следующую:
-
-Для текущей сессии найди список уже заданных session_questions с q_type = 'coding' и их task_id.
-
-Если нужно выдать новую кодинговую задачу:
-
-Определи индекс кодинговой задачи (index).
-
-Выбери category = choose_code_category(track, index).
-
-Вызови generate_code_task(track, level, category, language="python", previous_topics=[topics...] ).
-
-Сохрани задачу в code_tasks (если ещё нет записи по task_id).
-
-Сгенерируй и сохрани тесты (public/hidden) через build_tests_for_task.
-
-Создай запись в session_questions:
-
-q_type = 'coding',
-
-questionId = <generated task_id or внутренний id>,
-
-questionTitle = task["title"],
-
-description = task["description_markdown"] (или отдельное поле),
-
-position — номер вопроса.
-
-В ответ API добавь:
-
-q_type: "coding",
-
-title и description,
-
-starterCode для фронта,
-
-language / allowedLanguages.
-
-Убедись, что фронт теперь показывает редактор кода по q_type = 'coding' и берёт starterCode из ответа бэкенда.
-
-Подзадача 6. Эндпоинты «Запустить примеры» и «Проверить решение»
-6.1. Кнопка «Запустить примеры»
-
-Реализуй эндпоинт POST /api/code/run-samples:
-
-Вход (Pydantic-модель):
-
-class RunSamplesPayload(BaseModel):
-    sessionId: str
-    questionId: str
-    taskId: str
-    ownerId: str
-    code: str
-    language: str
-
-
-Логика:
-
-Найди все code_tests с task_id и is_public = 1.
-
-Для каждого теста:
-
-запусти код пользователя в Docker,
-
-подставь аргументы input в функцию (согласно function_signature),
-
-собери actual.
-
-Верни:
+Она должна считать:
 
 {
-  "tests": [
-    {"name": "пример_1", "status": "passed", "expected": 6, "actual": 6},
-    {"name": "пример_2", "status": "failed", "expected": -1, "actual": 0}
-  ],
-  "hasError": false
+  "overall": {
+    "total_questions": 8,
+    "theory_questions": 4,
+    "coding_questions": 4,
+
+    "total_score": 60,
+    "max_total_score": 80,
+    "score_ratio": 0.75,
+
+    "time_total_sec": 3600,
+    "avg_time_per_question_sec": 450
+  },
+  "by_type": {
+    "theory": {
+      "score": 30,
+      "max_score": 40,
+      "score_ratio": 0.75,
+      "avg_score_per_question": 7.5
+    },
+    "coding": {
+      "score": 30,
+      "max_score": 40,
+      "score_ratio": 0.75,
+      "avg_attempts": 1.8,
+      "avg_hints_used": 0.5
+    }
+  },
+  "by_track": {
+    "backend": { ... },
+    "ds": { ... }
+  },
+  "anti_cheat": {
+    "suspicious_events": 0,
+    "notes": "Подозрительных действий не зафиксировано"
+  }
 }
 
+4. Структура итогового отчёта (что отдавать фронту / сохранять в БД)
 
-В случае ошибки исполнения (исключение, timeout) вызови LLM-ментор (см. Подзадачу 7) и верни:
+Реализуй таблицу interview_reports и JSON-структуру:
 
 {
-  "tests": [],
-  "hasError": true
+  "session_id": "uuid",
+  "owner_id": "candidate-id",
+  "track": "backend",
+  "level": "middle",
+  "created_at": "...",
+
+  "metrics": { ... },           // результат build_session_metrics
+  "questions": [ ... ],         // массив normalized_question_report
+  "llm_summary_candidate": "...", // текстовый отчёт для кандидата
+  "llm_summary_admin": "...",     // текстовый отчёт для рекрутера/компании
+  "next_recommendations": {       // структурированные рекомендации
+    "difficulty": "increase",     
+    "tracks": ["backend", "system design"],
+    "topics_to_improve": [
+      "Транзакции и паттерн Saga",
+      "Стратегии кэширования и инвалидации"
+    ]
+  }
 }
 
+5. LLM для красивого текстового отчёта
 
-Не увеличивай счётчик попыток и не ставь баллы.
+Тут самое вкусное: у тебя уже есть структурированные данные, поэтому отчёт лучше генерировать одним LLM-вызовом, а не городить «магический» текст из кода.
 
-6.2. Кнопка «Проверить решение»
+5.1. System-промт для отчёта
 
-Реализуй эндпоинт POST /api/code/check:
+Реализуй:
 
-Вход (Pydantic):
+SYSTEM_PROMPT_INTERVIEW_REPORT = """
+/no_think Ты — опытный технический тимлид и наставник.
+Твоя задача — по структурированным данным о собеседовании:
 
-class CheckCodePayload(BaseModel):
-    sessionId: str
-    questionId: str
-    taskId: str
-    ownerId: str
-    code: str
-    language: str
-
-
-Логика:
-
-Определи номер попытки для этой (sessionId, questionId, taskId, ownerId) как attempt_number = предыдущий_max + 1.
-
-Запусти все public-тесты.
-
-Если есть ошибка исполнения → см. Подзадачу 7 (LLM-объяснение), увеличь attempt, создай запись в code_attempts c:
-
-passed_public = 0, passed_hidden = 0, score = 0,
-
-верни solved = false, publicTests с status = "error", hasError = true.
-
-Если просто часть тестов упала:
-
-не запускай скрытые тесты,
-
-создай запись code_attempts с passed_public = 0, passed_hidden = 0, score = 0,
-
-верни solved = false, publicTests с passed/failed, hiddenPassed = false.
-
-Если все public-тесты пройдены:
-
-Запусти все hidden-тесты.
-
-Если скрытые тесты не пройдены:
-
-создай запись code_attempts с passed_public = 1, passed_hidden = 0, score = 0,
-
-верни solved = false, hiddenPassed = false.
-
-Если все hidden-тесты пройдены:
-
-вычисли score по номеру попытки:
-
-def score_for_attempt(attempt: int, max_score: int = 10) -> int:
-    if attempt == 1:
-        return max_score
-    if attempt == 2:
-        return int(max_score * 0.7)
-    if attempt == 3:
-        return int(max_score * 0.5)
-    return 0
-
-
-создай запись code_attempts с passed_public = 1, passed_hidden = 1, score = score_for_attempt(attempt),
-
-верни:
-
-{
-  "solved": true,
-  "attempt": <номер_попытки>,
-  "score": <балл>,
-  "maxScore": 10,
-  "publicTests": [...],
-  "hiddenPassed": true
-}
-
-Подзадача 7. Обработка ошибок кода и LLM-объяснение в чат
-
-Реализуй логику «умного объяснения ошибок» при падении кода пользователя.
-
-При запуске кода (в /run-samples и /check) если:
-
-Docker возвращает ненулевой exit-code,
-
-время выполнения превышено,
-
-либо парсинг результата завершился исключением,
-
-то:
-
-собери:
-
-язык (language),
-
-function_signature,
-
-фрагмент кода пользователя (полностью или обрезанный до разумного размера),
-
-текст ошибки/traceback.
-
-Вызови qwen3-coder-30b-a3b-instruct-fp8 с отдельным промтом-ментором.
-
-System-промт ментора по ошибкам
-SYSTEM_PROMPT_CODE_ERROR_MENTOR = """
-/no_think Ты — доброжелательный ментор по программированию.
-
-Твоя задача:
-- по коду пользователя и тексту ошибки кратко объяснить, в чём суть проблемы,
-- мягко направить пользователя в сторону верного решения,
-- НЕ давать готового полного решения и НЕ переписывать всю функцию за него.
+- кратко описать общий уровень кандидата,
+- выделить сильные стороны,
+- честно, но аккуратно описать зоны роста,
+- дать рекомендации, куда двигаться дальше.
 
 Требования:
 - Пиши на русском языке.
-- Объясняй простыми словами (2–5 предложений).
-- Не раскрывай полный правильный код.
-- Не используй фразы вида 'вот исправленное решение', 'замени весь код на...' и т.п.
-- Даём только направление: на что обратить внимание (индексы, границы циклов, типы данных, граничные случаи, пустые входы и т.д.).
+- Раздели отчёт на блоки с заголовками: 
+  1) Итоговая оценка 
+  2) Сильные стороны 
+  3) Зоны роста 
+  4) Рекомендации по развитию.
+- Не повторяй дословно тексты вопросов; пересказывай своими словами.
+- Используй данные о баллах, попытках, подсказках и покрытии key_points, чтобы делать выводы об уровне.
+- Отдельно отметь разницу между теорией и практикой (код).
+- Не придумывай факты, которых нет в данных (если чего-то не хватает, просто не упоминай это).
 """
 
-User-промт для ментора
-def build_user_prompt_code_error(language: str, function_signature: str, user_code: str, error_text: str) -> str:
+5.2. User-промт для отчёта
+
+Реализуй:
+
+def build_user_prompt_interview_report(session_summary: dict) -> str:
+    """
+    session_summary — dict с:
+      - metrics
+      - questions (уже нормализованные)
+    """
+    # Лучше передавать JSON текстом, но явно обозначить формат
     return f"""
-Проанализируй ошибку в коде.
+Ниже приведены структурированные данные о собеседовании в формате JSON.
 
-Язык: {language}
-Сигнатура функции: {function_signature}
-
-Код пользователя:
-```{language}
-{user_code}
+Данные:
+```json
+{json.dumps(session_summary, ensure_ascii=False)}
 
 
-Текст ошибки/traceback:
-{error_text}
+На основе этих данных:
 
-Объясни кратко, в чём проблема, и подскажи, что нужно проверить или поправить, но не давай готового решения и не пиши полный исправленный код.
+Сформируй подробный, но компактный отчёт о кандидате.
+
+Соблюдай структуру: 'Итоговая оценка', 'Сильные стороны', 'Зоны роста', 'Рекомендации по развитию'.
+
+Особое внимание:
+
+какие темы кандидат раскрывал хорошо (по key_points и score_ratio),
+
+где часто не хватало ключевых пунктов,
+
+как он справлялся с задачами по коду (сколько попыток, сколько подсказок).
 """
 
 
-3. Полученный от LLM текст (ответ) сохрани как новое сообщение в таблице чата текущей сессии:
-   - `role = 'assistant'` или `'interviewer'`,
-   - `source = 'code_error_hint'` (если есть такое поле),
-   - `message = <ответ LLM>`.
+### 5.3. Генерация двух версий отчёта
 
-4. Обеспечь, чтобы фронтенд показывал это сообщение в панели чата рядом с задачей, когда пользователь получает ошибку при запуске кода.
+Реализуй:
 
----
+```python
+def generate_interview_reports_text(session_id: str) -> tuple[str, str]:
+    summary = build_full_session_summary(session_id)  # metrics + questions + anti_cheat
 
-## Подзадача 8. Проверка целостности и интеграция
+    # Отчёт для кандидата
+    messages_candidate = [
+        {"role": "system", "content": SYSTEM_PROMPT_INTERVIEW_REPORT},
+        {"role": "user", "content": build_user_prompt_interview_report(summary)},
+    ]
+    resp_cand = client.chat.completions.create(
+        model="qwen3-32b-awq",
+        messages=messages_candidate,
+        temperature=0.4,
+        max_tokens=1500,
+    )
+    text_candidate = resp_cand.choices[0].message.content.strip()
 
-1. Убедись, что:
+    # Отчёт для админа/компании — тот же summary, но доп. акцент
+    SYSTEM_PROMPT_INTERVIEW_REPORT_ADMIN = SYSTEM_PROMPT_INTERVIEW_REPORT + """
+Дополнительно:
+- Пиши чуть более формально.
+- Можешь упомянуть, подходит ли кандидат для middle-уровня, junior+ или senior-, исходя из данных.
+- Отдельно оцени риски: нестабильность знаний, слабые места, которые критичны для продакшн-разработки.
+"""
+    messages_admin = [
+        {"role": "system", "content": SYSTEM_PROMPT_INTERVIEW_REPORT_ADMIN},
+        {"role": "user", "content": build_user_prompt_interview_report(summary)},
+    ]
+    resp_admin = client.chat.completions.create(
+        model="qwen3-32b-awq",
+        messages=messages_admin,
+        temperature=0.3,
+        max_tokens=1500,
+    )
+    text_admin = resp_admin.choices[0].message.content.strip()
 
-   - выдача вопросов теперь различает `q_type = 'coding'` и `q_type = 'theory'`,
-   - редактор кода на фронте показывается **по `q_type`, а не по `useIDE`**,
-   - новые эндпоинты `/api/code/run-samples` и `/api/code/check` доступны и возвращают корректный JSON.
+    return text_candidate, text_admin
 
-2. Проверь полный цикл:
+6. Когда генерировать отчёт
 
-   - старт интервью с кодинговыми задачами,
-   - выдача первой кодинговой задачи (LLM-генерация → сохранение в БД → ответ на фронт),
-   - запуск «Запустить примеры»:
-     - успешный случай (видно результаты тестов),
-     - случай с ошибкой (появляется сообщение в чате).
-   - запуск «Проверить решение»:
-     - провал по открытым тестам,
-     - провал по скрытым,
-     - успешное решение с 1, 2 и 3 попытки (проверить начисление баллов и запись в `code_attempts`).
+Реализуй формирование отчёта в момент, когда:
 
-3. Убедись, что логика подсчёта баллов за кодинговые задачи интегрируется с общей системой баллов инт
+пользователь нажимает кнопку «Завершить собеседование»,
+или
+
+все вопросы отмечены как status = 'done'.
+
+Пайплайн:
+
+Закрыть сессию (sessions.status = 'finished').
+
+Вызвать:
+
+summary = build_full_session_summary(session_id)
+
+text_candidate, text_admin = generate_interview_reports_text(session_id)
+
+Сохранить в interview_reports:
+
+metrics = summary["metrics"],
+
+questions = summary["questions"],
+
+llm_summary_candidate = text_candidate,
+
+llm_summary_admin = text_admin,
+
+next_recommendations — можешь вытащить как отдельное поле из LLM (например, попросить LLM вернуть JSON с рекомендациями в отдельном вызове).
+
+Отдать на фронт:
+
+короткий summary (оценка, общие баллы),
+
+id отчёта для детального просмотра.
+
+7. Что в итоге получится
+
+Для кандидата: читаемый, структурный отчёт «где я молодец, что подтянуть, какие темы учить», основанный НЕ на чувствах интервьюера, а на:
+
+покрытии key_points,
+
+баллах за код,
+
+количестве подсказок,
+
+попытках и времени.
+
+Для компании: формальный JSON + текст, где:
+
+видно баллы по блокам (теория/код/направления),
+
+видны слабые зоны (например, «кандидат часто проваливал domain-задачи по backend»),
+
+есть прозрачная история: почему итоговый verdict именно такой.
+
+На старнице админ реализуй кнопку отчет , нажав по которой будет скачиваться txt файл с отчетом от данного участника(последнего его собеседования).
+На странице профиль , на панели "Истории собеседований" уже есть кнопки "Отчет" , реализуй чтобы при нажатии на неё скачивался отчет по конкртному собеседованию

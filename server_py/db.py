@@ -78,13 +78,20 @@ def ensure_schema():
         CREATE TABLE IF NOT EXISTS messages (
           id TEXT PRIMARY KEY,
           sessionId TEXT NOT NULL,
+          ownerId TEXT,
           questionId TEXT,
           role TEXT NOT NULL,
           content TEXT NOT NULL,
+          source TEXT,
           createdAt TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    msg_cols = [c[1] for c in cur.execute("PRAGMA table_info(messages)").fetchall()]
+    if "ownerId" not in msg_cols:
+        cur.execute("ALTER TABLE messages ADD COLUMN ownerId TEXT")
+    if "source" not in msg_cols:
+        cur.execute("ALTER TABLE messages ADD COLUMN source TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS reports (
@@ -304,6 +311,8 @@ def ensure_schema():
         cur.execute("ALTER TABLE session_questions ADD COLUMN status TEXT DEFAULT 'active'")
     if "is_finished" not in sq_cols:
         cur.execute("ALTER TABLE session_questions ADD COLUMN is_finished INTEGER DEFAULT 0")
+    if "hints_used" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN hints_used INTEGER DEFAULT 0")
     # Добавляем недостающие колонки в session_questions
     sq_cols = [c[1] for c in cur.execute("PRAGMA table_info(session_questions)").fetchall()]
     if "meta_json" not in sq_cols:

@@ -11,7 +11,7 @@ import { Card } from "@/components/UI/Card";
 import { TestResults } from "@/components/Interview/TestResults";
 import { useRouter } from "next/navigation";
 import { TextArea } from "@/components/UI/TextArea";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/stores/auth";
 
@@ -62,6 +62,9 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     onSuccess: (result) => {
       if (current?.questionId && result?.attempt) {
         setAttemptsByQuestion((prev) => ({ ...prev, [current.questionId!]: result.attempt }));
+      }
+      if (result?.hasError) {
+        queryClient.invalidateQueries({ queryKey: ["chat", current.id, current.questionId] });
       }
       const passed = Boolean(result?.hiddenPassed && (result?.publicTests || []).every((t: any) => t.status === "passed"));
       const cases = (result?.publicTests || []).map((t: any) => ({
@@ -149,13 +152,16 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         questionId: current.questionId,
         taskId: current.codeTaskId,
         code,
-        language: current.language || "python",
+        language: selectedLanguage || current.language || "python",
         ownerId: user?.id,
       });
     },
     onSuccess: (res) => {
       setRunResult(res);
       setLastTestKind("run");
+      if (res?.hasError) {
+        queryClient.invalidateQueries({ queryKey: ["chat", current?.id, current?.questionId] });
+      }
     },
   });
 
@@ -199,6 +205,22 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     tests?: { name: string; status: string; expected: any; actual: any }[];
     hasError?: boolean;
   } | null>(null);
+  const hintMutation = useMutation({
+    mutationFn: async () => {
+      if (!current?.id || !current?.questionId || !current?.codeTaskId || !user?.id) throw new Error("missing_params");
+      return api.codeHint({
+        sessionId: current.id,
+        questionId: current.questionId,
+        taskId: current.codeTaskId,
+        language: selectedLanguage || current.language || "python",
+        ownerId: user.id,
+        userCode: code,
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["chat", current?.id, current?.questionId] });
+    },
+  });
   const [supportOpen, setSupportOpen] = useState(false);
   const [supportMessages, setSupportMessages] = useState<
     { id: string; role: string; content: string; createdAt: string }[]
@@ -209,7 +231,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const [finishConfirm, setFinishConfirm] = useState(false);
   const [scoreModal, setScoreModal] = useState<{ open: boolean; score: number | null }>({ open: false, score: null });
   const current = storedSession ?? session ?? null;
-  const currentIndex =
+const currentIndex =
     current && current.usedQuestions
       ? Math.max(
           0,
@@ -222,6 +244,17 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       : [];
   const usedCount = current?.usedQuestions?.length ?? 0;
   const totalCount = current?.total ?? questionButtons.length ?? usedCount ?? 0;
+  const [selectedLanguage, setSelectedLanguage] = useState<string>(current?.language || "python");
+  const languageOptions = useMemo(() => {
+    const base = [current?.language || "python", "python", "javascript", "cpp"];
+    return Array.from(new Set(base.filter(Boolean)));
+  }, [current?.language]);
+
+  useEffect(() => {
+    if (current?.language) {
+      setSelectedLanguage(current.language);
+    }
+  }, [current?.language]);
 
   useEffect(() => {
     const load = async () => {
@@ -437,70 +470,80 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         total={totalCount}
       />
       <div className="flex flex-wrap items-center gap-2">
-        {questionButtons.map((q, idx) => (
-          <button
-            key={q.id}
-            className={`rounded-full px-3 py-2 text-sm ${
-              q.id === current.questionId ? "bg-vibe-600 text-white" : "border border-[var(--border)] text-[var(--muted)]"
-            }`}
-            onClick={async () => {
-              if (!q.id || q.id.startsWith("placeholder")) {
-                if (totalCount && usedCount >= totalCount) return;
-                const next = await api.nextQuestion(current.id);
-                const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
-                const updatedUsed = (merged.usedQuestions ?? current.usedQuestions ?? []).length
-                  ? merged.usedQuestions ?? current.usedQuestions ?? []
-                  : [
-                      ...(current.usedQuestions ?? []),
-                      ...(merged.questionId ? [{ id: merged.questionId, title: merged.questionTitle, qType: merged.useIDE ? "coding" : "theory", codeTaskId: merged.codeTaskId, position: (current.usedQuestions?.length ?? 0) }] : []),
-                    ];
-                setSession({ ...merged, usedQuestions: updatedUsed, total: merged.total ?? updatedUsed.length });
-                setInterviewId(merged.id);
-                setFollowUpQuestion(null);
-                setFollowUpAnswer("");
-                setMissingPoints([]);
-                setBaseScore(null);
-                setFollowLocked(false);
-                setAnswer("");
-                if (merged.useIDE) {
-                  const initial = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
-                  setCode(initial);
-                  setCodeByQuestion((prev) => {
-                    const updated = { ...prev };
-                    if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
-                      updated[merged.questionId] = merged.starterCode;
-                    }
-                    if (typeof window !== "undefined") {
-                      try {
-                        localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
-                      } catch {
-                        // ignore
+        <div className="flex flex-wrap items-center gap-2 flex-1">
+          {questionButtons.map((q, idx) => (
+            <button
+              key={q.id}
+              className={`rounded-full px-3 py-2 text-sm ${
+                q.id === current.questionId ? "bg-vibe-600 text-white" : "border border-[var(--border)] text-[var(--muted)]"
+              }`}
+              onClick={async () => {
+                if (!q.id || q.id.startsWith("placeholder")) {
+                  if (totalCount && usedCount >= totalCount) return;
+                  const next = await api.nextQuestion(current.id);
+                  const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
+                  const updatedUsed = (merged.usedQuestions ?? current.usedQuestions ?? []).length
+                    ? merged.usedQuestions ?? current.usedQuestions ?? []
+                    : [
+                        ...(current.usedQuestions ?? []),
+                        ...(merged.questionId ? [{ id: merged.questionId, title: merged.questionTitle, qType: merged.useIDE ? "coding" : "theory", codeTaskId: merged.codeTaskId, position: (current.usedQuestions?.length ?? 0) }] : []),
+                      ];
+                  setSession({ ...merged, usedQuestions: updatedUsed, total: merged.total ?? updatedUsed.length });
+                  setInterviewId(merged.id);
+                  setFollowUpQuestion(null);
+                  setFollowUpAnswer("");
+                  setMissingPoints([]);
+                  setBaseScore(null);
+                  setFollowLocked(false);
+                  setAnswer("");
+                  if (merged.useIDE) {
+                    const initial = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
+                    setCode(initial);
+                    setCodeByQuestion((prev) => {
+                      const updated = { ...prev };
+                      if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
+                        updated[merged.questionId] = merged.starterCode;
                       }
-                    }
-                    return updated;
-                  });
+                      if (typeof window !== "undefined") {
+                        try {
+                          localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
+                        } catch {
+                          // ignore
+                        }
+                      }
+                      return updated;
+                    });
+                  } else {
+                    setCode("");
+                  }
                 } else {
-                  setCode("");
+                  const s = await api.getInterviewSession(current.id, q.id);
+                  const merged = { ...s, startedAt: s.startedAt ?? current.startedAt, timer: s.timer ?? current.timer };
+                  setSession(merged);
+                  setInterviewId(merged.id);
+                  const content = await api.getAnswer(merged.id, merged.questionId ?? "");
+                  setAnswer(content.content ?? "");
+                  setAnswersState((prev) => ({ ...prev, [merged.questionId ?? ""]: content.content ?? "" }));
+                  setFollowUpQuestion(null);
+                  setFollowUpAnswer("");
+                  setMissingPoints([]);
+                  setBaseScore(null);
+                  setFollowLocked(false);
                 }
-              } else {
-                const s = await api.getInterviewSession(current.id, q.id);
-                const merged = { ...s, startedAt: s.startedAt ?? current.startedAt, timer: s.timer ?? current.timer };
-                setSession(merged);
-                setInterviewId(merged.id);
-                const content = await api.getAnswer(merged.id, merged.questionId ?? "");
-                setAnswer(content.content ?? "");
-                setAnswersState((prev) => ({ ...prev, [merged.questionId ?? ""]: content.content ?? "" }));
-                setFollowUpQuestion(null);
-                setFollowUpAnswer("");
-                setMissingPoints([]);
-                setBaseScore(null);
-                setFollowLocked(false);
-              }
-            }}
-          >
-            Вопрос {idx + 1}
-          </button>
-        ))}
+              }}
+            >
+              Вопрос {idx + 1}
+            </button>
+          ))}
+        </div>
+        <Button
+          variant="outline"
+          className="flex h-14 w-14 shrink-0 items-center justify-center rounded-lg border-rose-500 bg-rose-50 text-rose-700 shadow-sm hover:bg-rose-100 dark:border-rose-500/70 dark:bg-rose-900/30 dark:text-rose-100 dark:hover:bg-rose-900/50"
+          onClick={() => setFinishConfirm(true)}
+          title="Завершить собеседование"
+        >
+          <span className="text-2xl font-bold leading-none">✕</span>
+        </Button>
       </div>
       <div
         className={cn(
@@ -641,7 +684,21 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
             </Card>
           )}
           {current.useIDE && (
-            <Card>
+            <Card className="relative">
+              <div className="absolute right-3 top-3 z-10 flex items-center gap-2 rounded-md border border-[var(--border)] bg-white/90 px-2 py-1 text-sm dark:bg-black/50">
+                <span className="text-[var(--muted)]">Язык:</span>
+                <select
+                  value={selectedLanguage}
+                  onChange={(e) => setSelectedLanguage(e.target.value)}
+                  className="rounded border border-[var(--border)] bg-white px-2 py-1 text-sm text-black focus:outline-none dark:bg-slate-800 dark:text-white"
+                >
+                  {languageOptions.map((lang) => (
+                    <option key={lang} value={lang}>
+                      {lang}
+                    </option>
+                  ))}
+                </select>
+              </div>
               <EditorPane
                 sessionId={current.id}
                 questionId={current.questionId}
@@ -739,17 +796,15 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
             }}
           />
         )}
-        <div
-          className="flex flex-col min-w-[240px]"
-        >
-          <ChatPane sessionId={current.id} questionId={current.questionId} />
-          <Button
-            variant="outline"
-            className="mt-3 border-rose-400 bg-rose-50 text-rose-700 shadow-sm hover:bg-rose-100 dark:border-rose-500/70 dark:bg-rose-900/30 dark:text-rose-100 dark:hover:bg-rose-900/50"
-            onClick={() => setFinishConfirm(true)}
-          >
-            Завершить собеседование
-          </Button>
+        <div className="relative flex flex-1 min-w-[520px] w-full">
+          <ChatPane
+            sessionId={current.id}
+            questionId={current.questionId}
+            taskId={current.codeTaskId}
+            ownerId={user?.id}
+            language={selectedLanguage || current.language}
+            userCode={codeByQuestion[current.questionId ?? ""] ?? code}
+          />
         </div>
       </div>
     </main>
