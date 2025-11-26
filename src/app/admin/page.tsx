@@ -139,7 +139,6 @@ export default function AdminPage() {
               <tr>
                 <th className="py-2">Имя</th>
                 <th>Email</th>
-                <th>Уровень</th>
                 <th>Роль</th>
                 <th>Тема</th>
                 <th>Score</th>
@@ -158,7 +157,6 @@ export default function AdminPage() {
                 >
                   <td className="py-2 font-semibold">{c.name}</td>
                   <td className="text-[var(--muted)]">{c.email}</td>
-                  <td>{c.level}</td>
                   <td className="text-sm">{c.role ?? (c.admin ? "admin" : "user")}</td>
                   <td>{c.lastTopic}</td>
                   <td>

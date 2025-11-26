@@ -1381,10 +1381,53 @@ def report(report_id: str, download: Optional[int] = 0):
     cur = conn.cursor()
     # Пытаемся найти новый отчёт
     rep = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE id=? OR sessionId=?", (report_id, report_id)))
+    if not rep:
+        # попробуем сгенерировать на лету
+        session_row = fetchone_dict(cur.execute("SELECT * FROM sessions WHERE id=?", (report_id,)))
+        if session_row:
+            try:
+                summary = build_full_session_summary(report_id)
+                cand_text, admin_text = generate_interview_reports_text(report_id)
+                rep_id = str(uuid.uuid4())
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO interview_reports (id, sessionId, ownerId, track, level, metrics_json, questions_json, summary_candidate, summary_admin, recommendations_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rep_id,
+                        report_id,
+                        session_row.get("ownerId"),
+                        session_row.get("direction"),
+                        session_row.get("level"),
+                        json.dumps(summary.get("metrics") or {}),
+                        json.dumps(summary.get("questions") or []),
+                        cand_text,
+                        admin_text,
+                        json.dumps(summary.get("anti_cheat") or {}),
+                    ),
+                )
+                conn.commit()
+                rep = fetchone_dict(cur.execute("SELECT * FROM interview_reports WHERE id=?", (rep_id,)))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on-demand report generation failed", extra={"error": str(exc)})
     if rep:
         conn.close()
         if download:
-            return PlainTextResponse(rep.get("summary_candidate") or "Отчёт отсутствует", headers={"Content-Disposition": f"attachment; filename=report-{rep.get('sessionId')}.txt"})
+            # формируем имя файла: YYYY-MM-DD_track_level.txt
+            fname_parts = []
+            try:
+                sess = fetchone_dict(sqlite3.connect(DB_PATH).cursor().execute("SELECT * FROM sessions WHERE id=?", (rep.get("sessionId"),)))
+                if sess and sess.get("createdAt"):
+                    fname_parts.append(sess.get("createdAt")[0:10])
+                if sess and sess.get("direction"):
+                    fname_parts.append(sess.get("direction"))
+                if sess and sess.get("level"):
+                    fname_parts.append(sess.get("level"))
+            except Exception:
+                pass
+            fname = "_".join([p for p in fname_parts if p]) or "report"
+            return PlainTextResponse(rep.get("summary_candidate") or "Отчёт отсутствует", headers={"Content-Disposition": f"attachment; filename=\"%s.txt\"" % fname})
         return {
             "report": {
                 "id": rep.get("id"),
@@ -1399,6 +1442,7 @@ def report(report_id: str, download: Optional[int] = 0):
                 "recommendations": json.loads(rep.get("recommendations_json") or "{}"),
             }
         }
+    # старый fallback
     cur.execute("SELECT * FROM reports WHERE id=?", (report_id,))
     row = fetchone_dict(cur)
     conn.close()

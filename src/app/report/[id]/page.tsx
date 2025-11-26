@@ -1,4 +1,5 @@
 "use client";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/services/api";
 import { Card } from "@/components/UI/Card";
@@ -10,9 +11,41 @@ import { Heatmap } from "@/components/Charts/Heatmap";
 import { Sparkline } from "@/components/Charts/Sparkline";
 
 export default function ReportPage({ params }: { params: { id: string } }) {
-  const { data } = useQuery({ queryKey: ["report", params.id], queryFn: () => api.getReport(params.id) });
+  const [progress, setProgress] = useState(12);
+  const { data, isLoading, isFetching } = useQuery({
+    queryKey: ["report", params.id],
+    queryFn: () => api.getReport(params.id),
+  });
 
-  if (!data) return <div>Грузим отчёт...</div>;
+  useEffect(() => {
+    if (!isLoading && !isFetching) return;
+    const timer = setInterval(() => {
+      setProgress((p) => (p >= 90 ? 90 : p + 5));
+    }, 300);
+    return () => clearInterval(timer);
+  }, [isLoading, isFetching]);
+
+  if (isLoading || isFetching) {
+    return (
+      <main className="space-y-4">
+        <div>
+          <div className="text-sm text-[var(--muted)]">Формируем отчёт...</div>
+          <h1 className="text-2xl font-semibold">Отчёт по сессии {params.id}</h1>
+        </div>
+        <div className="w-full rounded-xl border border-[var(--border)] bg-[var(--card)] p-4">
+          <div className="mb-2 text-sm text-[var(--muted)]">Ожидайте, идёт генерация</div>
+          <div className="relative h-3 w-full overflow-hidden rounded-full bg-[var(--border)]">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-vibe-500 to-vibe-700 transition-all"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!data) return <div>Отчёт не найден</div>;
 
   return (
     <main className="space-y-4">
