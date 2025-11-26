@@ -1,6 +1,6 @@
 "use client";
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { api } from "@/services/api";
 import { Button } from "@/components/UI/Button";
@@ -8,11 +8,11 @@ import { Card } from "@/components/UI/Card";
 import { useSessionStore } from "@/stores/session";
 import { useAuthStore } from "@/stores/auth";
 import { useEffect } from "react";
+import { AssignedInterview } from "@/types";
 
-const directions = ["Frontend", "Backend", "DS", "ML", "DevOps", "System Design", "Fullstack"];
+const directions = ["Frontend", "Backend", "DS", "ML", "DevOps", "Fullstack"];
 const difficulties = ["Junior", "Middle", "Senior"] as const;
-const formats = ["Full interview", "Quick interview", "Only coding", "Algorithms", "Architecture"];
-const taskTypes = ["Coding", "Algorithms", "Architecture", "Debug", "Theory"];
+const taskTypes = ["Coding", "Algorithms", "Debug", "Theory"];
 
 type Level = (typeof difficulties)[number];
 
@@ -24,8 +24,14 @@ export default function SelectPage() {
   const user = useAuthStore((s) => s.user);
   const [direction, setDirection] = useState(directions[0]);
   const [level, setLevel] = useState<Level>("Middle");
-  const [format, setFormat] = useState(formats[0]);
+  const [format, setFormat] = useState<string>("Full interview");
   const [tasks, setTasks] = useState<string[]>(["Coding"]);
+  const { data: assignedList } = useQuery<AssignedInterview[]>({
+    queryKey: ["assigned-interviews"],
+    queryFn: api.getAssignedInterviews,
+    enabled: !!user,
+    refetchInterval: 5000,
+  });
 
   const toggleTask = (task: string) => {
     setTasks((prev) => (prev.includes(task) ? prev.filter((t) => t !== task) : [...prev, task]));
@@ -33,6 +39,16 @@ export default function SelectPage() {
 
   const mutation = useMutation({
     mutationFn: () => api.startInterview({ direction, level, format, tasks }),
+    onSuccess: (session) => {
+      reset();
+      setSession(session);
+      setInterviewId(session.id);
+      router.push(`/interview/session/${session.id}`);
+    },
+  });
+
+  const startAssigned = useMutation({
+    mutationFn: (assignedId: string) => api.startAssignedInterview(assignedId),
     onSuccess: (session) => {
       reset();
       setSession(session);
@@ -88,6 +104,47 @@ export default function SelectPage() {
         </Button>
       </div>
 
+      {assignedList && assignedList.length > 0 && (
+        <Card title="Назначенные собеседования">
+          <div className="space-y-3">
+            {assignedList.map((assigned) => (
+              <div key={assigned.id} className="rounded-xl border border-[var(--border)] p-3">
+                <div className="grid gap-3 md:grid-cols-4">
+                  <div>
+                    <div className="text-sm text-[var(--muted)]">Статус</div>
+                    <div className="text-lg font-semibold capitalize">{assigned.status}</div>
+                  </div>
+                  <div>
+                    <div className="text-sm text-[var(--muted)]">Направление</div>
+                    <div className="text-lg font-semibold">{assigned.direction}</div>
+                  </div>
+                  <div>
+                    <div className="text-sm text-[var(--muted)]">Уровень</div>
+                    <div className="text-lg font-semibold">{assigned.level}</div>
+                  </div>
+                  <div>
+                    <div className="text-sm text-[var(--muted)]">Задачи</div>
+                    <div className="text-sm text-[var(--muted)]">{assigned.tasks?.join(", ") || "—"}</div>
+                  </div>
+                </div>
+                <div className="mt-3 flex items-center justify-between">
+                  <div className="text-sm text-[var(--muted)]">
+                    Назначено админом. Нажмите, чтобы продолжить или начать назначенное интервью.
+                  </div>
+                  <Button
+                    onClick={() => assigned.id && startAssigned.mutate(assigned.id)}
+                    disabled={startAssigned.isPending}
+                    className="bg-gradient-to-r from-vibe-500 to-vibe-700 text-white"
+                  >
+                    {startAssigned.isPending ? "Запускаем..." : assigned.status === "active" ? "Продолжить" : "Приступить к интервью"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
       <div className="grid gap-4 md:grid-cols-2">
         <Card title="Направление">
           <div className="flex flex-wrap gap-2">
@@ -107,7 +164,7 @@ export default function SelectPage() {
           </div>
         </Card>
 
-        <Card title="Сложность и формат">
+        <Card title="Сложность">
           <div className="flex flex-wrap gap-3">
             {difficulties.map((lvl) => (
               <button
@@ -120,21 +177,6 @@ export default function SelectPage() {
                 }`}
               >
                 {lvl}
-              </button>
-            ))}
-          </div>
-          <div className="mt-4 grid grid-cols-2 gap-2">
-            {formats.map((f) => (
-              <button
-                key={f}
-                onClick={() => setFormat(f)}
-                className={`rounded-xl border px-3 py-3 text-left text-sm transition ${
-                  f === format
-                    ? "border-vibe-400 bg-vibe-50 text-vibe-800 shadow-sm dark:bg-white/10 dark:text-white"
-                    : "border-[var(--border)] text-[var(--muted)] hover:border-vibe-300"
-                }`}
-              >
-                {f}
               </button>
             ))}
           </div>

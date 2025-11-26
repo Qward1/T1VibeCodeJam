@@ -68,7 +68,25 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   });
 
   const [answer, setAnswer] = useState("");
+  const [answersState, setAnswersState] = useState<Record<string, string>>({});
+  const [followUpQuestion, setFollowUpQuestion] = useState<string | null>(null);
+  const [followUpAnswer, setFollowUpAnswer] = useState("");
+  const [missingPoints, setMissingPoints] = useState<string[]>([]);
+  const [baseScore, setBaseScore] = useState<{ score: number; maxScore: number } | null>(null);
+  const [followUpState, setFollowUpState] = useState<
+    Record<
+      string,
+      {
+        question: string | null;
+        answer: string;
+        missing: string[];
+        base?: { score: number; maxScore: number } | null;
+      }
+    >
+  >({});
   const [answerStatus, setAnswerStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [followStatus, setFollowStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [followLocked, setFollowLocked] = useState(false);
   const [timeLeft, setTimeLeft] = useState(0);
   const lastCodeChange = useRef<number>(Date.now());
   const lastTestAt = useRef<number | null>(null);
@@ -97,21 +115,66 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         )
       : 0;
   const questionButtons =
-    current && current.total
-      ? Array.from({ length: current.total }, (_, i) => current.usedQuestions?.[i] ?? { id: `placeholder-${i}`, title: `Вопрос ${i + 1}` })
-      : current?.usedQuestions ?? [];
+    current && current.usedQuestions
+      ? current.usedQuestions.map((q, i) => q ?? { id: `placeholder-${i}`, title: `Вопрос ${i + 1}` })
+      : [];
   const usedCount = current?.usedQuestions?.length ?? 0;
   const totalCount = current?.total ?? questionButtons.length ?? usedCount ?? 0;
 
   useEffect(() => {
     const load = async () => {
       if (current?.id && current.questionId) {
-        const content = await api.getAnswer(current.id, current.questionId);
-        setAnswer(content);
+        // Всегда подтягиваем с бэка, чтобы избежать устаревшего состояния
+        const res = await api.getAnswer(current.id, current.questionId);
+        setAnswer(res.content);
+        setAnswersState((prev) => ({ ...prev, [current.questionId]: res.content ?? "" }));
+        if (res.decision && res.decision !== "clarify") {
+          setFollowLocked(true);
+        } else {
+          setFollowLocked(false);
+        }
+        const saved = followUpState[current.questionId];
+        if (saved) {
+          setFollowUpQuestion(saved.question);
+          setFollowUpAnswer(saved.answer);
+          setMissingPoints(saved.missing);
+          setBaseScore(saved.base || null);
+          setFollowLocked(saved.question === null && saved.base != null);
+        } else {
+          setFollowUpQuestion(null);
+          setFollowUpAnswer("");
+          setMissingPoints([]);
+          setBaseScore(null);
+          setFollowLocked(false);
+        }
       }
     };
     load();
-  }, [current?.id, current?.questionId]);
+  }, [current?.id, current?.questionId, followUpState, answersState]);
+
+  const loadNextQuestion = async () => {
+    if (!current?.id) return;
+    try {
+      const next = await api.nextQuestion(current.id);
+      const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
+      setSession(merged);
+      setInterviewId(merged.id);
+      if (merged.questionId && answersState[merged.questionId] !== undefined) {
+        setAnswer(answersState[merged.questionId]);
+      } else {
+        setAnswer("");
+      }
+      setFollowUpQuestion(null);
+      setFollowUpAnswer("");
+      setMissingPoints([]);
+      setBaseScore(null);
+      setFollowStatus("idle");
+      setAnswerStatus("idle");
+      setFollowLocked(false);
+    } catch (e) {
+      console.warn("nextQuestion failed", e);
+    }
+  };
 
   // Drag-resize для редактора/чата
   useEffect(() => {
@@ -254,14 +317,19 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                 const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
                 setSession(merged);
                 setInterviewId(merged.id);
-                setAnswer("");
+                if (merged.questionId) {
+                  setAnswer(answersState[merged.questionId] ?? "");
+                } else {
+                  setAnswer("");
+                }
               } else {
                 const s = await api.getInterviewSession(current.id, q.id);
                 const merged = { ...s, startedAt: s.startedAt ?? current.startedAt, timer: s.timer ?? current.timer };
                 setSession(merged);
                 setInterviewId(merged.id);
                 const content = await api.getAnswer(merged.id, merged.questionId ?? "");
-                setAnswer(content);
+                setAnswer(content.content ?? "");
+                setAnswersState((prev) => ({ ...prev, [merged.questionId ?? ""]: content.content ?? "" }));
               }
             }}
           >
@@ -286,18 +354,52 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
             <Card title="Ответ на задание">
               <TextArea
                 className="select-text"
-                value={answer}
-                onChange={(e) => setAnswer(e.target.value)}
+                value={answersState[current.questionId ?? ""] ?? answer}
+                onChange={(e) => {
+                  if (current?.questionId) {
+                    setAnswersState((prev) => ({ ...prev, [current.questionId]: e.target.value }));
+                  }
+                  setAnswer(e.target.value);
+                }}
                 placeholder="Опишите решение или вставьте код, если нет IDE"
               />
               <Button
                 onClick={async () => {
                   if (!current.id || !current.questionId) return;
+                  if (followUpQuestion || followLocked) {
+                    // Пока открыт follow-up или ответ уже зафиксирован — основная кнопка не активна
+                    return;
+                  }
                   try {
                     setAnswerStatus("saving");
-                    await api.saveAnswer(current.id, current.questionId, answer);
-                    setAnswerStatus("saved");
-                    setTimeout(() => setAnswerStatus("idle"), 1500);
+                    // Если уже есть follow-up вопрос — оцениваем уточнение
+                    const res = await api.evalTheoryAnswer({
+                      sessionId: current.id,
+                      questionId: current.questionId,
+                      ownerId: user?.id ?? "",
+                      answer,
+                    });
+                    setAnswersState((prev) => ({ ...prev, [current.questionId]: answer }));
+                    setBaseScore({ score: res.score, maxScore: res.maxScore });
+                    setFollowUpState((prev) => ({
+                      ...prev,
+                      [current.questionId]: {
+                        question: res.followUp?.question || null,
+                          answer: "",
+                          missing: res.missingPoints || [],
+                          base: { score: res.score, maxScore: res.maxScore },
+                        },
+                      }));
+                    if (res.followUp?.question) {
+                      setFollowUpQuestion(res.followUp.question);
+                      setMissingPoints(res.missingPoints || []);
+                      setFollowUpAnswer("");
+                    } else {
+                      setFollowLocked(true);
+                      await loadNextQuestion();
+                    }
+                  setAnswerStatus("saved");
+                  setTimeout(() => setAnswerStatus("idle"), 1500);
                   } catch (e) {
                     setAnswerStatus("error");
                   }
@@ -307,6 +409,68 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
               >
                 {answerStatus === "saving" ? "Сохраняем..." : answerStatus === "saved" ? "Сохранено" : "Сохранить ответ"}
               </Button>
+              {followUpQuestion && (
+                <div className="mt-4 space-y-2">
+                  <div className="text-sm font-semibold">Уточняющий вопрос</div>
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-3 text-sm">
+                    {followUpQuestion}
+                  </div>
+                  <TextArea
+                    className="select-text"
+                    value={followUpAnswer}
+                    onChange={(e) => setFollowUpAnswer(e.target.value)}
+                    placeholder="Ответьте на уточняющий вопрос"
+                  />
+                  <Button
+                    onClick={async () => {
+                      if (!current?.id || !current.questionId) return;
+                      try {
+                        setFollowStatus("saving");
+                      const res = await api.evalTheoryFollowup({
+                        sessionId: current.id,
+                        questionId: current.questionId,
+                        ownerId: user?.id ?? "",
+                        answer: followUpAnswer,
+                        followupQuestion: followUpQuestion || "",
+                        missingPoints,
+                      });
+                      // усредняем балл основного и уточнения
+                        if (baseScore) {
+                          const combinedScore = Math.round((baseScore.score + (res.score ?? 0)) / 2);
+                          const maxScore = Math.max(baseScore.maxScore, res.maxScore ?? baseScore.maxScore);
+                          const persistedAnswer = answersState[current.questionId] ?? answer;
+                          await api.saveAnswer(current.id, current.questionId, persistedAnswer); // чтобы обновить контент
+                          // заглушка: бэкенд уже сохраняет score, но здесь только фиксируем UI
+                          setBaseScore({ score: combinedScore, maxScore });
+                          setAnswersState((prev) => ({ ...prev, [current.questionId]: answer }));
+                          setFollowUpState((prev) => ({
+                            ...prev,
+                            [current.questionId]: {
+                              question: null,
+                              answer: "",
+                              missing: [],
+                              base: { score: combinedScore, maxScore },
+                            },
+                          }));
+                        }
+                        setFollowUpQuestion(null);
+                        setFollowUpAnswer("");
+                        setMissingPoints([]);
+                        setFollowLocked(true);
+                        await loadNextQuestion();
+                        setFollowStatus("saved");
+                        setTimeout(() => setFollowStatus("idle"), 1500);
+                      } catch (e) {
+                        setFollowStatus("error");
+                      }
+                    }}
+                    size="md"
+                    className="w-full bg-vibe-100 text-vibe-700"
+                  >
+                    {followStatus === "saving" ? "Оцениваем..." : "Отправить ответ"}
+                  </Button>
+                </div>
+              )}
             </Card>
           )}
           {current.useIDE && (

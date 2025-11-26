@@ -16,47 +16,9 @@ def connect():
 
 
 def seed_questions(cur, force: bool = False):
-    samples = [
-        (
-            "q1",
-            "Два числа",
-            "Даны числа и target. Верните индексы двух чисел, сумма которых равна target. Используйте O(n).",
-            "[i, j], где nums[i] + nums[j] === target",
-            "Подумайте про хеш-таблицу",
-            "Junior",
-            "arrays,hashmap",
-            1,
-        ),
-        (
-            "q2",
-            "Минимальный путь",
-            "Найдите кратчайший путь в ориентированном графе без отрицательных весов.",
-            "Используйте Дейкстру",
-            "Очередь с приоритетом ускорит решение",
-            "Middle",
-            "graph,dijkstra",
-            1,
-        ),
-        (
-            "q3",
-            "Дедупликация логов",
-            "Есть поток логов. Реализуйте структуру, которая выдаёт уникальные записи за последние 5 минут.",
-            "Используйте очередь + хешсет с экспирацией",
-            "Подумайте про скользящее окно",
-            "Middle",
-            "queue,sliding-window",
-            0,
-        ),
-    ]
+    """Заглушка: больше не сидируем вопросы автоматически."""
     if force:
         cur.execute("DELETE FROM questions")
-    cur.executemany(
-        """
-        INSERT OR IGNORE INTO questions (id, title, body, answer, hint, difficulty, tags, useIDE)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        samples,
-    )
 
 
 def ensure_schema():
@@ -159,6 +121,9 @@ def ensure_schema():
           ownerId TEXT NOT NULL,
           content TEXT NOT NULL,
           updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
+          score INTEGER,
+          max_score INTEGER,
+          decision TEXT,
           UNIQUE(sessionId, questionId)
         )
         """
@@ -207,6 +172,8 @@ def ensure_schema():
         cur.execute("ALTER TABLE sessions ADD COLUMN is_active INTEGER DEFAULT 1")
     if "is_finished" not in session_cols:
         cur.execute("ALTER TABLE sessions ADD COLUMN is_finished INTEGER DEFAULT 0")
+    if "assignedId" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN assignedId TEXT")
     message_cols = [c[1] for c in cur.execute("PRAGMA table_info(messages)").fetchall()]
     if "questionId" not in message_cols:
         cur.execute("ALTER TABLE messages ADD COLUMN questionId TEXT")
@@ -235,6 +202,9 @@ def ensure_schema():
           ownerId TEXT NOT NULL,
           content TEXT NOT NULL,
           updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
+          score INTEGER,
+          max_score INTEGER,
+          decision TEXT,
           UNIQUE(sessionId, questionId)
         )
         """
@@ -252,6 +222,20 @@ def ensure_schema():
     )
     if "questionId" not in session_cols:
         cur.execute("ALTER TABLE sessions ADD COLUMN questionId TEXT")
+    # Добавляем недостающие поля в answers
+    ans_cols = [c[1] for c in cur.execute("PRAGMA table_info(answers)").fetchall()]
+    if "score" not in ans_cols:
+        cur.execute("ALTER TABLE answers ADD COLUMN score INTEGER")
+    if "max_score" not in ans_cols:
+        cur.execute("ALTER TABLE answers ADD COLUMN max_score INTEGER")
+    if "decision" not in ans_cols:
+        cur.execute("ALTER TABLE answers ADD COLUMN decision TEXT")
+    # Добавляем недостающие колонки в session_questions
+    sq_cols = [c[1] for c in cur.execute("PRAGMA table_info(session_questions)").fetchall()]
+    if "meta_json" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN meta_json TEXT")
+    if "q_type" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN q_type TEXT DEFAULT 'coding'")
     # Сообщения поддержки
     cur.execute(
         """
@@ -272,29 +256,44 @@ def ensure_schema():
         )
         """
     )
-    question_cols = [c[1] for c in cur.execute("PRAGMA table_info(questions)").fetchall()]
-    if "useIDE" not in question_cols or len(question_cols) < 6:
-        cur.execute("DROP TABLE IF EXISTS questions")
-        cur.execute(
-            """
-            CREATE TABLE questions (
-              id TEXT PRIMARY KEY,
-              title TEXT NOT NULL,
-              body TEXT NOT NULL,
-              answer TEXT NOT NULL,
-              hint TEXT,
-              difficulty TEXT NOT NULL,
-              tags TEXT,
-              useIDE INTEGER DEFAULT 0,
-              createdAt TEXT DEFAULT CURRENT_TIMESTAMP,
-              updatedAt TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+    # Создаём таблицу questions под новую схему, не очищая существующие данные
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS questions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          direction TEXT,
+          difficulty TEXT,
+          type TEXT,
+          title TEXT NOT NULL,
+          statement TEXT NOT NULL,
+          language TEXT,
+          visible_tests_json TEXT,
+          hidden_tests_json TEXT,
+          canonical_answer TEXT,
+          useIDE INTEGER DEFAULT 0
         )
-    # Сидим примеры, если база пустая
-    existing = cur.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
-    if existing == 0:
-        seed_questions(cur)
+        """
+    )
+    # Назначенные интервью
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS assigned_interviews (
+          id TEXT PRIMARY KEY,
+          candidateId TEXT NOT NULL,
+          adminId TEXT NOT NULL,
+          direction TEXT,
+          level TEXT,
+          format TEXT,
+          tasks TEXT,
+          duration INTEGER,
+          status TEXT DEFAULT 'pending',
+          sessionId TEXT,
+          createdAt TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    # Связь сессии с назначением
+    session_cols = [c[1] for c in cur.execute("PRAGMA table_info(sessions)").fetchall()]
     conn.commit()
     conn.close()
 

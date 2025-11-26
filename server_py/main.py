@@ -12,6 +12,8 @@ import sys
 import os
 import subprocess
 import tempfile
+import json
+import logging
 
 # Делаем путь к server_py доступным для импортов при запуске как скрипта
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -21,9 +23,20 @@ if str(CURRENT_DIR) not in sys.path:
 from db import ROOT, DATA_DIR, DB_PATH, sha1, fetchone_dict, fetchall_dicts, ensure_schema, seed_questions
 from api_next_question import router as next_router
 import random
+from llm_theory import (
+    classify_theory_answer,
+    generate_followup_question,
+    evaluate_theory_answer,
+    evaluate_followup_answer,
+    final_decision_after_followup,
+    generate_theory_question,
+    TheoryDecision,
+)
+from question_utils import pick_question, normalize_task_types, collect_previous_theory_topics
 
 MAX_QUESTIONS = 3  # легко менять при необходимости
 TIMER_SECONDS = 45 * 60
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Interview Platform API")
 app.add_middleware(
@@ -114,6 +127,28 @@ class AntiCheatEvent(BaseModel):
     payload: str | None = None
     risk: str | None = "medium"
 
+class AssignInterviewPayload(BaseModel):
+    adminId: str
+    candidateId: str
+    direction: str
+    level: str
+    format: str = "Full interview"
+    tasks: List[str] = []
+    duration: Optional[int] = None  # minutes
+
+class AssignedStartPayload(BaseModel):
+    userId: str
+
+class TheoryEvalPayload(BaseModel):
+    sessionId: str
+    questionId: str
+    ownerId: str
+    answer: str
+    isFollowup: bool = False
+    followupQuestion: Optional[str] = None
+    baseQuestionJson: Optional[dict] = None
+    missingPoints: Optional[List[str]] = None
+
 # --------- Инициализация БД
 
 def init_db():
@@ -166,21 +201,39 @@ def fetchall_dicts(cursor):
     columns = [col[0] for col in cursor.description]
     return [dict(zip(columns, r)) for r in rows]
 
+def ensure_admin_user(cur, admin_id: str):
+    cur.execute("SELECT * FROM users WHERE id=?", (admin_id,))
+    admin = fetchone_dict(cur)
+    if not admin or (not admin.get("admin") and admin.get("role") != "superadmin"):
+        return None
+    return admin
+
+
 
 # --------- Эндпоинты
 
 @app.post("/api/register")
 def register(payload: UserPayload):
+    email = (payload.email or "").strip().lower()
+    password = (payload.password or "").strip()
+    name = (payload.name or "Кандидат").strip() or "Кандидат"
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="invalid_payload")
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    if cur.execute("SELECT 1 FROM users WHERE email=?", (payload.email,)).fetchone():
+    existing = fetchone_dict(cur.execute("SELECT * FROM users WHERE email=?", (email,)))
+    if existing:
+        # Если аккаунт уже есть и пароль совпадает — ведём себя идемпотентно и возвращаем профиль
+        if existing.get("password") == sha1(password):
+            conn.close()
+            return {"user": user_safe(existing)}
         conn.close()
         raise HTTPException(status_code=409, detail="exists")
     # Только роль user при регистрации
     user_id = str(uuid.uuid4())
     cur.execute(
         "INSERT INTO users (id, email, name, password, level, role, admin, lang) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (user_id, payload.email, payload.name, sha1(payload.password), "Junior", "user", 0, payload.lang or "ru"),
+        (user_id, email, name, sha1(password), "Junior", "user", 0, payload.lang or "ru"),
     )
     conn.commit()
     row = cur.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
@@ -192,11 +245,15 @@ def register(payload: UserPayload):
 
 @app.post("/api/login")
 def login(payload: LoginPayload):
+    email = (payload.email or "").strip().lower()
+    password = (payload.password or "").strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="invalid_payload")
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         "SELECT * FROM users WHERE email=? AND password=?",
-        (payload.email, sha1(payload.password)),
+        (email, sha1(password)),
     )
     row = fetchone_dict(cur)
     conn.close()
@@ -317,21 +374,41 @@ def start_interview(payload: StartPayload):
                 "is_finished": existing.get("is_finished", 0),
             }
         }
-    cur.execute("SELECT * FROM questions ORDER BY RANDOM() LIMIT ?", (MAX_QUESTIONS,))
-    selected = fetchall_dicts(cur)
-    if not selected:
-        seed_questions(cur, force=True)
-        cur.execute("SELECT * FROM questions ORDER BY RANDOM() LIMIT ?", (MAX_QUESTIONS,))
-        selected = fetchall_dicts(cur)
-    if not selected:
+    # Всегда генерируем один теоретический вопрос через LLM
+    question_id = None
+    question_title = "Вопрос 1"
+    description = ""
+    question_type = "theory"
+    use_ide = False
+    meta_json = None
+    starter = ""
+
+    try:
+        # Пока сессия не создана — нет предыдущих вопросов
+        prev_topics: List[str] = []
+        q_obj = generate_theory_question((payload.direction or "fullstack").lower(), (payload.level or "middle").lower(), prev_topics)
+        question_id = f"llm-theory-{uuid.uuid4()}"
+        description = q_obj.get("question", "")
+        question_title = q_obj.get("title") or question_title
+        meta_json = json.dumps(q_obj, ensure_ascii=False)
+    except Exception as exc:
+        logger.exception("LLM generation failed on start-interview", extra={"direction": payload.direction, "level": payload.level})
+        question_id = None
+
+    if not question_id:
+        logger.error(
+            "No questions available after LLM generation",
+            extra={"direction": payload.direction, "level": payload.level, "tasks": payload.tasks},
+        )
         conn.close()
         raise HTTPException(status_code=404, detail="no_questions")
-    total_questions = min(len(selected), MAX_QUESTIONS)
-    question = selected[0]
+
+    total_questions = 1
     session_id = str(uuid.uuid4())
-    description = question["body"]
-    starter = """function twoSum(nums, target) {\n  const map = new Map();\n  for (let i = 0; i < nums.length; i++) {\n    const c = target - nums[i];\n    if (map.has(c)) return [map.get(c), i];\n    map.set(nums[i], i);\n  }\n  return [];\n}"""
     started_at = now_iso()
+    if question_type == "theory":
+        starter = ""
+
     cur.execute(
         """
         INSERT INTO sessions (id, ownerId, questionId, questionTitle, useIDE, direction, level, format, tasks, description, starterCode, timer, solved, total, startedAt, status, is_active, is_finished)
@@ -340,13 +417,13 @@ def start_interview(payload: StartPayload):
         (
             session_id,
             payload.userId,
-            question["id"],
-            question["title"],
-            int(question.get("useIDE", 1)),
+            question_id,
+            question_title,
+            int(use_ide),
             payload.direction,
             payload.level,
             payload.format,
-            ",".join(payload.tasks),
+            ",".join(["theory"]),
             description,
             starter,
             TIMER_SECONDS,
@@ -358,12 +435,21 @@ def start_interview(payload: StartPayload):
             0,
         ),
     )
-    # Добавляем выбранные вопросы в историю с порядком
-    for idx, q in enumerate(selected, start=1):
-        cur.execute(
-            "INSERT INTO session_questions (sessionId, questionId, questionTitle, position) VALUES (?, ?, ?, ?)",
-            (session_id, q["id"], q["title"], idx),
-        )
+    # Добавляем выбранный вопрос в историю с порядком
+    cur.execute(
+        """
+        INSERT INTO session_questions (sessionId, questionId, questionTitle, position, meta_json, q_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            question_id,
+            question_title,
+            1,
+            meta_json,
+            question_type or "coding",
+        ),
+    )
     # Черновик отчёта
     cur.execute(
         """
@@ -391,10 +477,10 @@ def start_interview(payload: StartPayload):
             "direction": payload.direction,
             "level": payload.level,
             "format": payload.format,
-            "tasks": payload.tasks,
-            "questionTitle": question["title"],
-            "questionId": question["id"],
-            "useIDE": bool(question.get("useIDE")),
+            "tasks": ["theory"],
+            "questionTitle": question_title,
+            "questionId": question_id,
+            "useIDE": bool(use_ide),
             "description": description,
             "starterCode": starter,
             "timer": TIMER_SECONDS,
@@ -440,8 +526,23 @@ def get_session(session_id: str, questionId: Optional[str] = None):
         if q:
             row["questionId"] = q["id"]
             row["questionTitle"] = q["title"]
-            row["description"] = q["body"]
+            row["description"] = q["statement"]
             row["useIDE"] = q.get("useIDE", 1)
+        else:
+            # Пробуем достать LLM-вопрос из session_questions.meta_json
+            meta = cur.execute(
+                "SELECT meta_json FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1",
+                (session_id, questionId),
+            ).fetchone()
+            if meta and meta[0]:
+                try:
+                    meta_obj = json.loads(meta[0])
+                    row["questionId"] = questionId
+                    row["questionTitle"] = meta_obj.get("title") or row.get("questionTitle")
+                    row["description"] = meta_obj.get("question") or row.get("description")
+                    row["useIDE"] = 0
+                except Exception:
+                    pass
     # История выданных вопросов
     used_questions = fetchall_dicts(
         cur.execute("SELECT questionId as id, questionTitle as title FROM session_questions WHERE sessionId=? ORDER BY position", (session_id,))
@@ -720,6 +821,281 @@ def support_send(payload: SupportSendPayload):
     conn.close()
     return {"status": "ok"}
 
+# --------- Назначенные интервью (админ)
+
+@app.post("/api/admin/assign-interview")
+def assign_interview(payload: AssignInterviewPayload):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    admin = ensure_admin_user(cur, payload.adminId)
+    if not admin:
+        conn.close()
+        raise HTTPException(status_code=403, detail="forbidden")
+    assigned_id = str(uuid.uuid4())
+    tasks_str = ",".join(payload.tasks or [])
+    duration_minutes = payload.duration if payload.duration and payload.duration > 0 else None
+    cur.execute(
+        """
+        INSERT INTO assigned_interviews (id, candidateId, adminId, direction, level, format, tasks, duration, status, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        """,
+        (
+            assigned_id,
+            payload.candidateId,
+            payload.adminId,
+            payload.direction,
+            payload.level,
+            payload.format or "Full interview",
+            tasks_str,
+            duration_minutes,
+            now_iso(),
+        ),
+    )
+    # Простое уведомление через таблицу событий
+    cur.execute(
+        """
+        INSERT INTO interview_events (id, sessionId, ownerId, event_type, payload, risk_level, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            "",
+            payload.candidateId,
+            "assigned_interview_created",
+            assigned_id,
+            "info",
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "assigned": {
+            "id": assigned_id,
+            "candidateId": payload.candidateId,
+            "adminId": payload.adminId,
+            "direction": payload.direction,
+            "level": payload.level,
+            "format": payload.format or "Full interview",
+            "tasks": payload.tasks or [],
+            "status": "pending",
+            "duration": duration_minutes,
+            "createdAt": now_iso(),
+        }
+    }
+
+@app.get("/api/assigned-interview")
+def get_assigned_interview(userId: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    row = cur.execute(
+        """
+        SELECT * FROM assigned_interviews
+        WHERE candidateId=? AND status IN ('pending', 'active')
+        ORDER BY datetime(createdAt) DESC
+        LIMIT 1
+        """,
+        (userId,),
+    ).fetchone()
+    columns = [c[0] for c in cur.description] if cur.description else []
+    assigned = dict(zip(columns, row)) if row else None
+    conn.close()
+    if not assigned:
+        return {"assigned": None}
+    assigned["tasks"] = (assigned.get("tasks") or "").split(",") if assigned.get("tasks") else []
+    return {"assigned": assigned}
+
+@app.get("/api/assigned-interviews")
+def list_assigned_interviews(userId: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    rows = cur.execute(
+        """
+        SELECT * FROM assigned_interviews
+        WHERE candidateId=? AND status IN ('pending', 'active')
+        ORDER BY datetime(createdAt) DESC
+        """,
+        (userId,),
+    ).fetchall()
+    cols = [c[0] for c in cur.description] if cur.description else []
+    items = [dict(zip(cols, r)) for r in rows]
+    conn.close()
+    for it in items:
+        it["tasks"] = (it.get("tasks") or "").split(",") if it.get("tasks") else []
+    return {"assigned": items}
+
+@app.post("/api/assigned-interview/start/{assigned_id}")
+def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM assigned_interviews WHERE id=?", (assigned_id,))
+    assigned = fetchone_dict(cur)
+    if not assigned:
+        conn.close()
+        raise HTTPException(status_code=404, detail="not_found")
+    if assigned.get("candidateId") != payload.userId:
+        conn.close()
+        raise HTTPException(status_code=403, detail="forbidden")
+    # Если уже есть активная сессия по назначению — возвращаем её
+    if assigned.get("status") == "active" and assigned.get("sessionId"):
+        session_id = assigned["sessionId"]
+        conn.close()
+        return get_session(session_id)
+    # Подготавливаем первый вопрос с учётом фильтров назначения
+    task_types = normalize_task_types((assigned.get("tasks") or "").split(",") if assigned.get("tasks") else [])
+
+    question_id = None
+    question_title = "Вопрос 1"
+    description = ""
+    question_type = "theory"
+    use_ide = False
+    meta_json = None
+    starter = ""
+
+    # Пытаемся сгенерировать теоретический вопрос для назначенного интервью
+    try:
+        prev_topics = collect_previous_theory_topics(cur, assigned.get("sessionId") or "")
+        q_obj = generate_theory_question((assigned.get("direction") or "fullstack").lower(), (assigned.get("level") or "middle").lower(), prev_topics)
+        question_id = f"llm-theory-{uuid.uuid4()}"
+        description = q_obj.get("question", "")
+        question_title = q_obj.get("title") or question_title
+        meta_json = json.dumps(q_obj, ensure_ascii=False)
+    except Exception as exc:
+        logger.exception("LLM generation failed on assigned-interview start", extra={"direction": assigned.get("direction"), "level": assigned.get("level")})
+        question_id = None
+
+    # Если теорию не удалось — пробуем coding как фолбэк
+    if not question_id:
+        q = pick_question(cur, assigned.get("direction"), assigned.get("level"), ["coding"], [])
+        if q:
+            question_id = q["id"]
+            question_title = q["title"]
+            description = q["statement"]
+            question_type = "coding"
+            use_ide = bool(q.get("useIDE", 1))
+
+    if not question_id:
+        logger.error(
+            "No questions available for assigned interview after LLM+coding fallback",
+            extra={"direction": assigned.get("direction"), "level": assigned.get("level"), "tasks": assigned.get("tasks")},
+        )
+        conn.close()
+        raise HTTPException(status_code=404, detail="no_questions")
+    total_questions = 1
+    session_id = str(uuid.uuid4())
+    starter = starter if question_type != "theory" else ""
+    started_at = now_iso()
+    timer_val = TIMER_SECONDS
+    try:
+        if assigned.get("duration"):
+            timer_val = int(assigned.get("duration")) * 60
+    except Exception:
+        timer_val = TIMER_SECONDS
+    cur.execute(
+        """
+        INSERT INTO sessions (id, ownerId, questionId, questionTitle, useIDE, direction, level, format, tasks, description, starterCode, timer, solved, total, startedAt, status, is_active, is_finished, assignedId)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            payload.userId,
+            question_id,
+            question_title,
+            int(use_ide),
+            assigned.get("direction"),
+            assigned.get("level"),
+            assigned.get("format") or "Full interview",
+            ",".join(["theory"]),
+            description,
+            starter,
+            timer_val,
+            0,
+            total_questions,
+            started_at,
+            "active",
+            1,
+            0,
+            assigned_id,
+        ),
+    )
+    cur.execute(
+        """
+        INSERT INTO session_questions (sessionId, questionId, questionTitle, position, meta_json, q_type)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            question_id,
+            question_title,
+            1,
+            meta_json,
+            question_type or "coding",
+        ),
+    )
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO reports (id, sessionId, ownerId, score, level, summary, timeline, solutions, analytics)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            session_id,
+            payload.userId,
+            0,
+            assigned.get("level"),
+            "Отчёт формируется",
+            "[]",
+            "[]",
+            "{}",
+        ),
+    )
+    # Обновляем назначение
+    cur.execute(
+        "UPDATE assigned_interviews SET status='active', sessionId=? WHERE id=?",
+        (session_id, assigned_id),
+    )
+    cur.execute(
+        """
+        INSERT INTO interview_events (id, sessionId, ownerId, event_type, payload, risk_level, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            session_id,
+            payload.userId,
+            "assigned_interview_started",
+            assigned_id,
+            "info",
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    used_questions = get_used_questions(cur, session_id)
+    conn.close()
+    return {
+        "session": {
+            "id": session_id,
+            "direction": assigned.get("direction"),
+            "level": assigned.get("level"),
+            "format": assigned.get("format") or "Full interview",
+            "tasks": ["theory"],
+            "questionTitle": question_title,
+            "questionId": question_id,
+            "useIDE": bool(use_ide),
+            "description": description,
+            "starterCode": starter,
+            "timer": timer_val,
+            "solved": 0,
+            "total": total_questions,
+            "startedAt": started_at,
+            "usedQuestions": used_questions,
+            "status": "active",
+            "is_active": 1,
+            "is_finished": 0,
+            "assignedId": assigned_id,
+        }
+    }
+
 
 @app.get("/api/support/messages")
 def support_messages(userId: str):
@@ -966,10 +1342,163 @@ def change_language(payload: ChangeLanguagePayload):
 def get_used_questions(cur, session_id: str):
     return fetchall_dicts(
         cur.execute(
-            "SELECT questionId as id, questionTitle as title FROM session_questions WHERE sessionId=? ORDER BY position",
+            "SELECT questionId as id, questionTitle as title, q_type FROM session_questions WHERE sessionId=? ORDER BY position",
             (session_id,),
         )
     )
+
+
+@app.post("/api/theory/eval")
+def eval_theory(payload: TheoryEvalPayload):
+    question_obj = payload.baseQuestionJson or {}
+    # Пытаемся взять вопрос из session_questions.meta_json, если не передали
+    if not question_obj:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT meta_json FROM session_questions WHERE sessionId=? AND questionId=? LIMIT 1",
+            (payload.sessionId, payload.questionId),
+        ).fetchone()
+        if row and row[0]:
+            try:
+                question_obj = json.loads(row[0])
+            except Exception:
+                question_obj = {}
+        conn.close()
+    if not question_obj:
+        raise HTTPException(status_code=400, detail="missing_question_data")
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # Проверяем существующий ответ
+    cur.execute(
+        "SELECT * FROM answers WHERE sessionId=? AND questionId=? AND ownerId=?",
+        (payload.sessionId, payload.questionId, payload.ownerId),
+    )
+    existing = fetchone_dict(cur)
+
+    if not payload.isFollowup:
+        if existing and existing.get("decision") and existing.get("decision") != TheoryDecision.CLARIFY.value:
+            conn.close()
+            return {
+                "decision": existing.get("decision"),
+                "score": existing.get("score"),
+                "maxScore": existing.get("max_score"),
+                "coveredPoints": [],
+                "missingPoints": [],
+                "feedbackShort": "",
+                "feedbackDetailed": "",
+                "followUp": None,
+            }
+        result = evaluate_theory_answer(question_obj, payload.answer)
+        decision = classify_theory_answer(result.get("score", 0), result.get("max_score", 1))
+        follow = None
+        if decision == TheoryDecision.CLARIFY:
+            follow_data = generate_followup_question(
+                question_obj,
+                result.get("missing_points", []),
+                payload.answer,
+            )
+            follow = {"question": follow_data.get("follow_up_question")}
+        # Сохраняем результат в answers
+        cur.execute(
+            """
+            INSERT INTO answers (id, sessionId, questionId, ownerId, content, updatedAt, score, max_score, decision)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sessionId, questionId) DO UPDATE SET
+              content=excluded.content,
+              updatedAt=excluded.updatedAt,
+              score=excluded.score,
+              max_score=excluded.max_score,
+              decision=excluded.decision
+            """,
+            (
+                str(uuid.uuid4()),
+                payload.sessionId,
+                payload.questionId,
+                payload.ownerId,
+                payload.answer,
+                now_iso(),
+                result.get("score", 0),
+                result.get("max_score", question_obj.get("max_score", 10)),
+                decision.value,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return {
+            "decision": decision.value,
+            "score": result.get("score"),
+            "maxScore": result.get("max_score"),
+            "verdict": result.get("verdict"),
+            "coveredPoints": result.get("covered_points", []),
+            "missingPoints": result.get("missing_points", []),
+            "feedbackShort": result.get("feedback_short"),
+            "feedbackDetailed": result.get("feedback_detailed"),
+            "followUp": follow,
+        }
+    else:
+        if existing and existing.get("decision") and existing.get("decision") != TheoryDecision.CLARIFY.value:
+            conn.close()
+            return {
+                "decision": existing.get("decision"),
+                "score": existing.get("score"),
+                "maxScore": existing.get("max_score"),
+                "coveredPoints": [],
+                "missingPoints": [],
+                "feedbackShort": "",
+                "feedbackDetailed": None,
+                "followUp": None,
+            }
+        missing_points = payload.missingPoints or []
+        follow_up_question = payload.followupQuestion or ""
+        follow_result = evaluate_followup_answer(
+            question_obj,
+            missing_points,
+            follow_up_question,
+            payload.answer,
+        )
+        decision = final_decision_after_followup(
+            0,
+            0,
+            follow_result.get("score", 0),
+            follow_result.get("max_score", 0),
+        )
+        cur.execute(
+            """
+            INSERT INTO answers (id, sessionId, questionId, ownerId, content, updatedAt, score, max_score, decision)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sessionId, questionId) DO UPDATE SET
+              content=excluded.content,
+              updatedAt=excluded.updatedAt,
+              score=excluded.score,
+              max_score=excluded.max_score,
+              decision=excluded.decision
+            """,
+            (
+                str(uuid.uuid4()),
+                payload.sessionId,
+                payload.questionId,
+                payload.ownerId,
+                payload.answer,
+                now_iso(),
+                follow_result.get("score", 0),
+                follow_result.get("max_score", 0),
+                decision.value,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return {
+            "decision": decision.value,
+            "score": follow_result.get("score"),
+            "maxScore": follow_result.get("max_score"),
+            "coveredPoints": follow_result.get("covered_points", []),
+            "missingPoints": follow_result.get("missing_points_still", []),
+            "feedbackShort": follow_result.get("feedback_short"),
+            "feedbackDetailed": None,
+            "followUp": None,
+        }
 
 
 @app.post("/api/anticheat/event")
@@ -1015,6 +1544,12 @@ def finish_interview(payload: FinishInterviewPayload):
     if session.get("ownerId"):
         cur.execute("DELETE FROM support_messages WHERE userId=?", (session.get("ownerId"),))
         cur.execute("DELETE FROM support_dialogs WHERE userId=?", (session.get("ownerId"),))
+    # Обновляем назначенное интервью, если есть связь
+    if session.get("assignedId"):
+        cur.execute(
+            "UPDATE assigned_interviews SET status='completed', sessionId=? WHERE id=?",
+            (payload.sessionId, session.get("assignedId")),
+        )
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -1059,10 +1594,17 @@ def get_answer(sessionId: str, questionId: str, ownerId: str):
     row = fetchone_dict(cur)
     conn.close()
     if not row:
-        return {"content": ""}
-    return {"content": row.get("content", "")}
+        return {"content": "", "decision": None, "score": None, "maxScore": None}
+    return {
+        "content": row.get("content", ""),
+        "decision": row.get("decision"),
+        "score": row.get("score"),
+        "maxScore": row.get("max_score"),
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    # Use full module path so running `python server_py/main.py` works reliably
+    uvicorn.run("server_py.main:app", host="0.0.0.0", port=8000, reload=True)

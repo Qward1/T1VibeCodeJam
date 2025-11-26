@@ -124,3 +124,17 @@ export type AdminOverview = {
     avgScore: number;
   };
 };
+
+export type AssignedInterview = {
+  id: string;
+  candidateId: string;
+  adminId: string;
+  direction: string;
+  level: Level;
+  format: string;
+  tasks: string[];
+  duration?: number | null;
+  status: "pending" | "active" | "completed";
+  sessionId?: string | null;
+  createdAt?: string;
+};

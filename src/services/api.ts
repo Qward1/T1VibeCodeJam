@@ -5,6 +5,7 @@ import {
   InterviewHistoryItem,
   InterviewReport,
   InterviewSession,
+  AssignedInterview,
   Level,
   LoginPayload,
   Message,
@@ -122,6 +123,8 @@ let history: InterviewHistoryItem[] = [
 ];
 
 const baseStarter = `function twoSum(nums, target) {\n  // Используйте хеш-таблицу для O(n)\n  const map = new Map();\n  for (let i = 0; i < nums.length; i++) {\n    const complement = target - nums[i];\n    if (map.has(complement)) return [map.get(complement), i];\n    map.set(nums[i], i);\n  }\n  return [];\n}`;
+let localAssigned: AssignedInterview | null = null;
+let localAssignedList: AssignedInterview[] = [];
 
 const buildTimeline = () => [
   { label: "task_start", at: new Date(Date.now() - 600000).toISOString() },
@@ -169,6 +172,40 @@ export const api = {
       return user;
     }
     return withDelay({ ...activeUser, admin: true, role: "admin" } as User);
+  },
+
+  // Назначение интервью админом
+  async assignInterview(candidateId: string, payload: { direction: string; level: Level; format: string; tasks: string[]; duration?: number }) {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      const { assigned } = await call<{ assigned: AssignedInterview }>("/api/admin/assign-interview", {
+        method: "POST",
+        body: JSON.stringify({
+          adminId: activeUser.id,
+          candidateId,
+          direction: payload.direction,
+          level: payload.level,
+          format: payload.format,
+          tasks: payload.tasks,
+          duration: payload.duration,
+        }),
+      });
+      return assigned;
+    }
+    localAssigned = {
+      id: `ass-${uid()}`,
+      candidateId,
+      adminId: activeUser?.id || "admin",
+      direction: payload.direction,
+      level: payload.level,
+      format: payload.format,
+      tasks: payload.tasks,
+      duration: payload.duration,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+    localAssignedList = [localAssigned];
+    return withDelay(localAssigned);
   },
 
   // Снятие прав админа (для супер-админа)
@@ -258,6 +295,28 @@ export const api = {
     return withDelay(history);
   },
 
+  async getAssignedInterview(): Promise<AssignedInterview | null> {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      const { assigned } = await call<{ assigned: AssignedInterview | null }>(
+        `/api/assigned-interview?userId=${activeUser.id}`
+      );
+      return assigned ?? null;
+    }
+    return withDelay(localAssigned);
+  },
+
+  async getAssignedInterviews(): Promise<AssignedInterview[]> {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      const { assigned } = await call<{ assigned: AssignedInterview[] }>(
+        `/api/assigned-interviews?userId=${activeUser.id}`
+      );
+      return assigned || [];
+    }
+    return withDelay(localAssignedList);
+  },
+
   async changeLanguage(lang: "ru" | "en") {
     if (useBackend && API_BASE) {
       if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
@@ -337,6 +396,44 @@ export const api = {
       },
       ...history,
     ];
+    return withDelay(session);
+  },
+
+  async startAssignedInterview(assignedId: string): Promise<InterviewSession> {
+    if (useBackend && API_BASE) {
+      if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
+      const { session } = await call<{ session: InterviewSession }>(
+        `/api/assigned-interview/start/${assignedId}`,
+        {
+          method: "POST",
+          body: JSON.stringify({ userId: activeUser.id }),
+        }
+      );
+      return session;
+    }
+    const session: InterviewSession = {
+      id: uid(),
+      ownerId: activeUser?.id,
+      direction: localAssigned?.direction || "Frontend",
+      level: (localAssigned?.level as Level) || "Middle",
+      format: localAssigned?.format || "Full interview",
+      tasks: localAssigned?.tasks || ["Coding"],
+      questionId: localQuestions[0].id,
+      questionTitle: localQuestions[0].title,
+      description: localQuestions[0].body,
+      starterCode: baseStarter,
+      useIDE: !!localQuestions[0].useIDE,
+      timer: 45 * 60,
+      startedAt: new Date().toISOString(),
+      solved: 0,
+      total: localQuestions.length,
+      usedQuestions: localQuestions.map((q) => ({ id: q.id, title: q.title })),
+    };
+    localSessions[session.id] = session;
+    if (localAssigned) {
+      localAssigned = { ...localAssigned, status: "active", sessionId: session.id };
+    }
+    localAssignedList = localAssignedList.map((a) => (a.id === assignedId ? { ...a, status: "active", sessionId: session.id } : a));
     return withDelay(session);
   },
 
@@ -440,15 +537,84 @@ export const api = {
     return withDelay(true);
   },
 
-  async getAnswer(sessionId: string, questionId: string): Promise<string> {
+  async getAnswer(sessionId: string, questionId: string): Promise<{ content: string; decision?: string | null; score?: number | null; maxScore?: number | null }> {
     if (useBackend && API_BASE) {
       if (!activeUser?.id) throw new Error("NO_ACTIVE_USER");
-      const { content } = await call<{ content: string }>(
+      const res = await call<{ content: string; decision?: string | null; score?: number | null; maxScore?: number | null }>(
         `/api/answer?sessionId=${sessionId}&questionId=${questionId}&ownerId=${activeUser.id}`
       );
-      return content ?? "";
+      return {
+        content: res.content ?? "",
+        decision: res.decision ?? null,
+        score: res.score ?? null,
+        maxScore: res.maxScore ?? null,
+      };
     }
-    return withDelay("");
+    return withDelay({ content: "", decision: null, score: null, maxScore: null });
+  },
+
+  async evalTheoryAnswer(params: {
+    sessionId: string;
+    questionId: string;
+    ownerId: string;
+    answer: string;
+    baseQuestionJson?: any;
+  }) {
+    const payload = {
+      sessionId: params.sessionId,
+      questionId: params.questionId,
+      ownerId: params.ownerId,
+      answer: params.answer,
+      isFollowup: false,
+      baseQuestionJson: params.baseQuestionJson,
+    };
+    const res = await call<{
+      decision: string;
+      score: number;
+      maxScore: number;
+      coveredPoints: string[];
+      missingPoints: string[];
+      feedbackShort?: string;
+      feedbackDetailed?: string;
+      followUp?: { question?: string } | null;
+    }>("/api/theory/eval", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return res;
+  },
+
+  async evalTheoryFollowup(params: {
+    sessionId: string;
+    questionId: string;
+    ownerId: string;
+    answer: string;
+    followupQuestion: string;
+    missingPoints: string[];
+    baseQuestionJson?: any;
+  }) {
+    const payload = {
+      sessionId: params.sessionId,
+      questionId: params.questionId,
+      ownerId: params.ownerId,
+      answer: params.answer,
+      isFollowup: true,
+      followupQuestion: params.followupQuestion,
+      missingPoints: params.missingPoints,
+      baseQuestionJson: params.baseQuestionJson,
+    };
+    const res = await call<{
+      decision: string;
+      score: number;
+      maxScore: number;
+      coveredPoints: string[];
+      missingPoints: string[];
+      feedbackShort?: string;
+    }>("/api/theory/eval", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return res;
   },
 
   async sendMessage(sessionId: string, msg: string, questionId?: string): Promise<Message> {

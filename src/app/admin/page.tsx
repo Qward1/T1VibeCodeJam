@@ -9,6 +9,7 @@ import { formatDate } from "@/utils";
 import { useAuthStore } from "@/stores/auth";
 import { Button } from "@/components/UI/Button";
 import { useEffect } from "react";
+import { Candidate, Level } from "@/types";
 
 export default function AdminPage() {
   const user = useAuthStore((s) => s.user);
@@ -64,6 +65,33 @@ export default function AdminPage() {
   });
   const [search, setSearch] = useState("");
   const isSuper = user?.role === "superadmin";
+  const directions = ["Frontend", "Backend", "DS", "ML", "DevOps", "Fullstack"];
+  const difficulties: Level[] = ["Junior", "Middle", "Senior"];
+  const taskTypes = ["Coding", "Algorithms", "Debug", "Theory"];
+  const [assignTarget, setAssignTarget] = useState<Candidate | null>(null);
+  const [assignDirection, setAssignDirection] = useState<string>(directions[0]);
+  const [assignLevel, setAssignLevel] = useState<Level>("Middle");
+  const [assignTasks, setAssignTasks] = useState<string[]>(["Coding"]);
+  const [assignDuration, setAssignDuration] = useState<number>(45);
+
+  const toggleAssignTask = (task: string) => {
+    setAssignTasks((prev) => (prev.includes(task) ? prev.filter((t) => t !== task) : [...prev, task]));
+  };
+
+  const assignMutation = useMutation({
+    mutationFn: () =>
+      api.assignInterview(assignTarget!.id, {
+        direction: assignDirection,
+        level: assignLevel,
+        format: "Full interview",
+        tasks: assignTasks,
+        duration: assignDuration,
+      }),
+    onSuccess: () => {
+      setAssignTarget(null);
+      queryClient.invalidateQueries({ queryKey: ["admin"] });
+    },
+  });
 
   const grantMutation = useMutation({
     mutationFn: (targetUserId: string) => api.grantAdmin(targetUserId),
@@ -92,7 +120,8 @@ export default function AdminPage() {
   }
 
   return (
-    <main className="space-y-6">
+    <>
+      <main className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
           <div className="text-sm text-[var(--muted)]">Админ-панель</div>
@@ -115,6 +144,7 @@ export default function AdminPage() {
                 <th>Тема</th>
                 <th>Score</th>
                 <th></th>
+                <th></th>
                 {isSuper && <th></th>}
               </tr>
             </thead>
@@ -133,6 +163,23 @@ export default function AdminPage() {
                   <td>{c.lastTopic}</td>
                   <td>
                     <Badge label={`${c.lastScore}`} tone={c.lastScore > 80 ? "success" : "info"} />
+                  </td>
+                  <td className="whitespace-nowrap">
+                    {c.role !== "admin" && c.role !== "superadmin" && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setAssignTarget(c);
+                          setAssignDirection(directions[0]);
+                          setAssignLevel("Middle");
+                          setAssignTasks(["Coding"]);
+                          setAssignDuration(45);
+                        }}
+                      >
+                        Назначить собеседование
+                      </Button>
+                    )}
                   </td>
                   <td>
                     <a
@@ -324,6 +371,105 @@ export default function AdminPage() {
           </div>
         </Card>
       </div>
-    </main>
+      </main>
+
+      {assignTarget && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 p-6">
+          <div className="relative w-full max-w-5xl rounded-2xl bg-white p-6 shadow-2xl dark:bg-slate-900">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="text-sm text-[var(--muted)]">Назначение собеседования</div>
+                <h2 className="text-2xl font-semibold">Кандидат: {assignTarget.name}</h2>
+                <div className="text-sm text-[var(--muted)]">Email: {assignTarget.email}</div>
+              </div>
+              <Button variant="outline" onClick={() => setAssignTarget(null)}>
+                Закрыть
+              </Button>
+            </div>
+            <div className="mt-6 grid gap-4 md:grid-cols-2">
+              <Card title="Направление">
+                <div className="flex flex-wrap gap-2">
+                  {directions.map((d) => (
+                    <button
+                      key={d}
+                      onClick={() => setAssignDirection(d)}
+                      className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                        d === assignDirection
+                          ? "bg-gradient-to-r from-vibe-500 to-vibe-700 text-white"
+                          : "border border-[var(--border)] text-[var(--muted)] hover:border-vibe-300"
+                      }`}
+                    >
+                      {d}
+                    </button>
+                  ))}
+                </div>
+              </Card>
+
+              <Card title="Сложность">
+                <div className="flex flex-wrap gap-3">
+                  {difficulties.map((lvl) => (
+                    <button
+                      key={lvl}
+                      onClick={() => setAssignLevel(lvl)}
+                      className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                        lvl === assignLevel
+                          ? "bg-vibe-600 text-white"
+                          : "border border-[var(--border)] text-[var(--muted)] hover:border-vibe-300"
+                      }`}
+                    >
+                      {lvl}
+                    </button>
+                  ))}
+                </div>
+              </Card>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <Card title="Типы задач">
+                <div className="flex flex-wrap gap-2">
+                  {taskTypes.map((t) => {
+                    const active = assignTasks.includes(t);
+                    return (
+                      <button
+                        key={t}
+                        onClick={() => toggleAssignTask(t)}
+                        className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                          active
+                            ? "bg-gradient-to-r from-vibe-500 to-vibe-700 text-white"
+                            : "border border-[var(--border)] text-[var(--muted)] hover:border-vibe-300"
+                        }`}
+                      >
+                        {t}
+                      </button>
+                    );
+                  })}
+                </div>
+              </Card>
+              <Card title="Длительность (мин)">
+                <input
+                  type="number"
+                  min={15}
+                  max={180}
+                  value={assignDuration}
+                  onChange={(e) => setAssignDuration(Number(e.target.value))}
+                  className="w-full rounded-xl border border-[var(--border)] bg-transparent px-3 py-2"
+                />
+                <p className="mt-2 text-sm text-[var(--muted)]">По умолчанию 45 минут, при необходимости измените.</p>
+              </Card>
+            </div>
+
+            <div className="mt-6 flex items-center justify-end">
+              <Button
+                onClick={() => assignMutation.mutate()}
+                disabled={assignMutation.isPending}
+                className="bg-gradient-to-r from-vibe-500 to-vibe-700 text-white"
+              >
+                {assignMutation.isPending ? "Назначаем..." : "Назначить собеседование"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
