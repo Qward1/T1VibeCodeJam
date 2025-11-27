@@ -306,6 +306,15 @@ def generate_code_task(
     previous_domain_topics: Optional[List[str]] = None,
 ) -> dict:
     def _parse_llm_json(raw_str: str) -> dict:
+        # если клиент уже вернул dict (parsed), отдаём сразу
+        if isinstance(raw_str, dict):
+            return raw_str
+        if isinstance(raw_str, list):
+            try:
+                joined = "".join(str(x) for x in raw_str)
+                raw_str = joined
+            except Exception:
+                pass
         text = raw_str.strip()
         fence = re.match(r"```(?:json)?(.*)```", text, re.S)
         if fence:
@@ -653,8 +662,13 @@ def build_tests_for_task(task: dict) -> tuple[list[dict], list[dict]]:
                 expected = _run_python_reference(task, args)
                 logger.info("Computed expected for test", extra={"task_id": task.get("task_id"), "test_name": inp.get("name"), "expected": expected})
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to compute expected for test; leaving expected=None", extra={"task_id": task.get("task_id"), "test_name": inp.get("name"), "error": str(exc)})
+                logger.warning("Failed to compute expected for test; will try fallback", extra={"task_id": task.get("task_id"), "test_name": inp.get("name"), "error": str(exc)})
                 expected = None
+        if expected is None:
+            expected = inp.get("expected")
+        if expected is None:
+            logger.warning("Skipping test without expected value", extra={"task_id": task.get("task_id"), "test_name": inp.get("name")})
+            continue
         test_obj = {"name": inp.get("name") or f"test_{idx+1}", "input": args, "expected": expected}
         if idx < len(sample_inputs):
             public_tests.append(test_obj)

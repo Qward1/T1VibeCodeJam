@@ -5,6 +5,7 @@ import path from "path";
 
 // Локальный маршрут смены пароля через SQLite (использует тот же файл, что и Python-API)
 export async function POST(req: Request) {
+  let db: Database | null = null;
   try {
     const { userId, oldPassword, newPassword } = (await req.json()) as {
       userId?: string;
@@ -16,7 +17,9 @@ export async function POST(req: Request) {
     }
 
     const dbPath = path.join(process.cwd(), "data", "api.sqlite");
-    const db = new Database(dbPath);
+    db = new Database(dbPath);
+    db.pragma("busy_timeout = 5000");
+    db.pragma("journal_mode = WAL");
 
     const sha1 = (val: string) => crypto.createHash("sha1").update(val).digest("hex");
 
@@ -30,5 +33,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ status: "ok" });
   } catch (e: any) {
     return NextResponse.json({ detail: "internal_error" }, { status: 500 });
+  } finally {
+    try {
+      db?.close();
+    } catch {}
   }
 }

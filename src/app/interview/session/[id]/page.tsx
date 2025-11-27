@@ -34,6 +34,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const router = useRouter();
   const queryClient = useQueryClient();
   const user = useAuthStore((s) => s.user);
+  const [attemptsByQuestion, setAttemptsByQuestion] = useState<Record<string, number>>({});
 
   useEffect(() => {
     if (!session) return;
@@ -60,6 +61,13 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       });
     },
     onSuccess: (result) => {
+      const attemptNum =
+        result?.attempt ??
+        (current?.questionId ? (attemptsByQuestion[current.questionId] ?? 0) : 0);
+      const solvedFlag =
+        Boolean(result?.hiddenPassed) &&
+        (result?.publicTests || []).every((t: any) => t.status === "passed");
+      const shouldLoadNext = Boolean(result?.finished || result?.solved || solvedFlag || attemptNum >= 3);
       if (current?.questionId && result?.attempt) {
         setAttemptsByQuestion((prev) => ({ ...prev, [current.questionId!]: result.attempt }));
       }
@@ -93,62 +101,16 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       }
       lastTestAt.current = now;
       // Если бэкенд вернул новый вопрос — добавляем кнопку
-      if (result?.finished && result?.nextQuestion) {
-        setLoadingNext(true);
-        const nextQ = result.nextQuestion;
-        setSession((prev) => {
-          if (!prev) return prev;
-          const used = prev.usedQuestions ?? [];
-          const already = used.find((q) => q.id === nextQ.id);
-          const updatedUsed = already
-            ? used
-            : [...used, { id: nextQ.id, title: nextQ.title, qType: nextQ.qType, codeTaskId: nextQ.codeTaskId, position: nextQ.position }];
-          const total = Math.max(prev.total ?? updatedUsed.length, updatedUsed.length);
-          return {
-            ...prev,
-            usedQuestions: updatedUsed,
-            total,
-            questionId: nextQ.id,
-            questionTitle: nextQ.title,
-            useIDE: nextQ.qType === "coding",
-            codeTaskId: nextQ.codeTaskId ?? prev.codeTaskId,
-            starterCode: nextQ.starterCode ?? prev.starterCode,
-          };
-        });
-        setTestResult(undefined);
-        setRunResult(null);
-        setLastTestKind(null);
-        const starter = nextQ.starterCode as string | undefined;
-        setCodeByQuestion((prev) => {
-          const updated = { ...prev };
-          if (starter && !(nextQ.id in updated)) {
-            updated[nextQ.id] = starter;
-          }
-          if (typeof window !== "undefined") {
-            try {
-              localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
-            } catch {
-              // ignore
-            }
-          }
-          return updated;
-        });
-        // сразу переключаем редактор на новую задачу
-        if (nextQ.qType === "coding") {
-          const fromCache = codeByQuestion[nextQ.id];
-          const initialCode = fromCache ?? starter ?? "";
-          setCode(initialCode);
-        } else {
-          setCode("");
+      // ???? ??????? ???????? ??????????? - ?????? ?????????
+      if (shouldLoadNext) {
+        if (result?.nextQuestion) {
+          applyNextQuestion(result.nextQuestion);
+        } else if (current?.id) {
+          api
+            .nextQuestion(current.id)
+            .then(applyNextQuestion)
+            .catch((e) => console.warn("nextQuestion fallback failed", e));
         }
-        // сбрасываем состояния для нового вопроса
-        setAnswer("");
-        setFollowUpQuestion(null);
-        setFollowUpAnswer("");
-        setMissingPoints([]);
-        setBaseScore(null);
-        setFollowLocked(false);
-        setLoadingNext(false);
       }
     },
   });
@@ -174,15 +136,6 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   });
 
   const [answer, setAnswer] = useState("");
-  const [codeByQuestion, setCodeByQuestion] = useState<Record<string, string>>(() => {
-    if (typeof window === "undefined") return {};
-    try {
-      const raw = localStorage.getItem(storageKey);
-      return raw ? (JSON.parse(raw) as Record<string, string>) : {};
-    } catch {
-      return {};
-    }
-  });
   const [answersState, setAnswersState] = useState<Record<string, string>>({});
   const [followUpQuestion, setFollowUpQuestion] = useState<string | null>(null);
   const [followUpAnswer, setFollowUpAnswer] = useState("");
@@ -235,25 +188,47 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   >([]);
   const [supportInput, setSupportInput] = useState("");
   const [lastTestKind, setLastTestKind] = useState<"check" | "run" | null>(null);
-  const [attemptsByQuestion, setAttemptsByQuestion] = useState<Record<string, number>>({});
   const [finishConfirm, setFinishConfirm] = useState(false);
   const [scoreModal, setScoreModal] = useState<{ open: boolean; score: number | null }>({ open: false, score: null });
   const [finishing, setFinishing] = useState(false);
   const current = storedSession ?? session ?? null;
   const storageKey = useMemo(() => `vibe-code-by-question:${current?.id || "global"}`, [current?.id]); // eslint-disable-line react-hooks/exhaustive-deps
-const currentIndex =
-    current && current.usedQuestions
-      ? Math.max(
-          0,
-          current.usedQuestions.findIndex((q) => q?.id === current.questionId)
-        )
-      : 0;
-  const questionButtons =
-    current && current.usedQuestions
-      ? current.usedQuestions.map((q, i) => q ?? { id: `placeholder-${i}`, title: `Вопрос ${i + 1}` })
-      : [];
-  const usedCount = current?.usedQuestions?.length ?? 0;
-  const totalCount = current?.total ?? questionButtons.length ?? usedCount ?? 0;
+  const [codeByQuestion, setCodeByQuestion] = useState<Record<string, string>>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = localStorage.getItem(storageKey);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = localStorage.getItem(storageKey);
+      setCodeByQuestion(raw ? JSON.parse(raw) : {});
+    } catch {
+      setCodeByQuestion({});
+    }
+  }, [storageKey]);
+  type QuestionTab = { questionId?: string; title?: string; qType?: string; codeTaskId?: string; isUnlocked: boolean };
+  const [questionTabs, setQuestionTabs] = useState<QuestionTab[]>([{ isUnlocked: true }]);
+  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
+  const currentIndex = activeQuestionIndex;
+  const usedCount = questionTabs.length;
+  const totalCount = usedCount;
+  // гарантируем, что текущий вопрос всегда присутствует в списке usedQuestions
+  useEffect(() => {
+    if (!current?.questionId) return;
+    const exists = (current.usedQuestions || []).some((q) => q?.id === current.questionId);
+    if (!exists) {
+      setSession((prev) => {
+        if (!prev) return prev;
+        const updated = [...(prev.usedQuestions ?? []), { id: current.questionId, title: current.questionTitle, qType: current.useIDE ? "coding" : "theory", codeTaskId: current.codeTaskId, position: prev.usedQuestions?.length ?? 0 }];
+        return { ...prev, usedQuestions: updated, total: Math.max(prev.total ?? updated.length, updated.length) };
+      });
+    }
+  }, [current?.questionId, current?.questionTitle, current?.useIDE, current?.codeTaskId, current?.usedQuestions, setSession]);
   const [selectedLanguage, setSelectedLanguage] = useState<string>(current?.language || "python");
   const languageOptions = useMemo(() => {
     const base = [current?.language || "python", "python", "javascript", "cpp"];
@@ -272,29 +247,52 @@ const currentIndex =
     (next: any) => {
       setLoadingNext(true);
       const merged = { ...next, startedAt: next.startedAt ?? current?.startedAt, timer: next.timer ?? current?.timer };
+      const totalSlots = merged.total || current?.total || 10;
+      const idxFromPos = typeof merged.position === "number" && merged.position > 0 ? merged.position - 1 : undefined;
+      const targetIndex = idxFromPos !== undefined ? idxFromPos : Math.max(0, (current?.usedQuestions?.length || 0));
+      // Добавляем метаданные о новом вопросе, но не переключаемся на него автоматически
       setSession((prev) => {
-        const base = { ...(merged || prev || {}) };
-        const prevUsed = base.usedQuestions ?? prev?.usedQuestions ?? [];
-        const exists = base.questionId ? prevUsed.find((q) => q.id === base.questionId) : undefined;
-        const updatedUsed =
-          exists || !base.questionId
+        if (!prev) return prev;
+        const prevUsed = prev.usedQuestions ?? [];
+        const exists = merged.questionId ? prevUsed.find((q) => q.id === merged.questionId) : undefined;
+        const appended =
+          exists || !merged.questionId
             ? prevUsed
-            : [...prevUsed, { id: base.questionId, title: base.questionTitle, qType: base.useIDE ? "coding" : "theory", codeTaskId: base.codeTaskId, position: prevUsed.length }];
-        return { ...base, usedQuestions: updatedUsed, total: base.total ?? updatedUsed.length };
+            : [
+                ...prevUsed,
+                {
+                  id: merged.questionId,
+                  title: merged.questionTitle,
+                  qType: merged.qType || (merged.useIDE ? "coding" : "theory"),
+                  codeTaskId: merged.codeTaskId,
+                  position: prevUsed.length + 1,
+                },
+              ];
+        const total = merged.total ?? prev.total ?? appended.length;
+        return { ...prev, usedQuestions: appended, total };
       });
-      setInterviewId(merged.id);
-      if (merged.questionId && answersState[merged.questionId] !== undefined) {
-        setAnswer(answersState[merged.questionId]);
-      } else {
-        setAnswer("");
-      }
-      if (merged.useIDE) {
-        const cached = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
+      setInterviewId(current?.id || merged.id);
+      // обновляем вкладки и активный индекс, но не переключаемся автоматически
+      setQuestionTabs((prev) => {
+        const size = Math.max(totalSlots, prev.length, targetIndex + 2);
+        const arr: QuestionTab[] = Array.from({ length: size }, (_, i) => prev[i] ?? { isUnlocked: i === 0 });
+        arr[targetIndex] = {
+          ...(arr[targetIndex] || {}),
+          questionId: merged.questionId,
+          title: merged.questionTitle,
+          qType: merged.qType || (merged.useIDE ? "coding" : "theory"),
+          codeTaskId: merged.codeTaskId,
+          isUnlocked: true,
+        };
+        if (targetIndex + 1 < arr.length) {
+          arr[targetIndex + 1] = { ...(arr[targetIndex + 1] || {}), isUnlocked: true };
+        }
+        return arr.slice(0, totalSlots);
+      });
+      // активный вопрос оставляем прежним: не переключаем автоматически
+      if (merged.useIDE && merged.questionId && merged.starterCode && !(merged.questionId in codeByQuestion)) {
         setCodeByQuestion((prev) => {
-          const updated = { ...prev };
-          if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
-            updated[merged.questionId] = merged.starterCode;
-          }
+          const updated = { ...prev, [merged.questionId!]: merged.starterCode! };
           if (typeof window !== "undefined") {
             try {
               localStorage.setItem(storageKey, JSON.stringify(updated));
@@ -304,9 +302,6 @@ const currentIndex =
           }
           return updated;
         });
-        setCode(cached);
-      } else {
-        setCode("");
       }
       setFollowUpQuestion(null);
       setFollowUpAnswer("");
@@ -316,9 +311,27 @@ const currentIndex =
       setAnswerStatus("idle");
       setFollowLocked(false);
       setLoadingNext(false);
+
     },
-    [answersState, codeByQuestion, current?.startedAt, current?.timer, setSession, setInterviewId, storageKey]
+    [codeByQuestion, current?.id, current?.usedQuestions, current?.total, current?.startedAt, current?.timer, setSession, setInterviewId, storageKey]
   );
+
+  useEffect(() => {
+    if (!current) return;
+    // синхронизируем вкладки
+    setQuestionTabs((prev) => {
+      const total = Math.max(current.total || 1, prev.length, (current.usedQuestions?.length || 0) || 1);
+      const arr: QuestionTab[] = Array.from({ length: total }, (_, i) => prev[i] ?? { isUnlocked: i === 0 });
+      (current.usedQuestions || []).forEach((q, idx) => {
+        const pos = typeof q.position === "number" && q.position > 0 ? q.position - 1 : idx;
+        arr[pos] = { ...(arr[pos] || {}), questionId: q.id, title: q.title, qType: q.qType, codeTaskId: q.codeTaskId, isUnlocked: true };
+        if (pos + 1 < arr.length) arr[pos + 1] = { ...(arr[pos + 1] || {}), isUnlocked: true };
+      });
+      return arr;
+    });
+    const idx = current.usedQuestions?.findIndex((q) => q.id === current.questionId);
+    if (idx !== undefined && idx >= 0) setActiveQuestionIndex(idx);
+  }, [current?.id, current?.questionId, current?.usedQuestions, current?.total]);
 
   useEffect(() => {
     const load = async () => {
@@ -333,6 +346,8 @@ const currentIndex =
           const finalCode = savedLocal ?? (savedBackend || current.starterCode || "");
           setCode(finalCode);
           setCodeByQuestion((prev) => ({ ...prev, [current.questionId]: finalCode }));
+        } else {
+          setCode("");
         }
         if (res.decision && res.decision !== "clarify") {
           setFollowLocked(true);
@@ -356,7 +371,17 @@ const currentIndex =
       }
     };
     load();
-  }, [current?.id, current?.questionId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current?.id, current?.questionId, current?.useIDE]);
+
+  // подтягиваем сохранённый код из localStorage при смене вопроса
+  useEffect(() => {
+    if (!current?.useIDE || !current?.questionId) return;
+    const saved = codeByQuestion[current.questionId];
+    if (saved !== undefined) {
+      setCode(saved);
+    }
+  }, [codeByQuestion, current?.questionId, current?.useIDE, setCode]);
 
   const loadNextQuestion = async () => {
     if (!current?.id) return;
@@ -503,55 +528,32 @@ const currentIndex =
       />
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex flex-wrap items-center gap-2 flex-1">
-          {questionButtons.map((q, idx) => (
+          {questionTabs.map((q, idx) => (
             <button
-              key={q.id}
+              key={q.questionId || `tab-${idx}`}
+              disabled={!q.isUnlocked || !q.questionId}
               className={`rounded-full px-3 py-2 text-sm ${
-                q.id === current.questionId ? "bg-vibe-600 text-white" : "border border-[var(--border)] text-[var(--muted)]"
+                idx === activeQuestionIndex
+                  ? "bg-vibe-600 text-white"
+                  : q.isUnlocked && q.questionId
+                    ? "border border-[var(--border)] text-[var(--muted)]"
+                    : "border border-dashed border-[var(--border)] text-[var(--muted)] opacity-60"
               }`}
               onClick={async () => {
-                if (!q.id || q.id.startsWith("placeholder")) {
+                if (!q.questionId || q.questionId.startsWith("placeholder")) {
                   if (totalCount && usedCount >= totalCount) return;
+                  if (!current?.id) return;
+                  setActiveQuestionIndex(idx);
                   setLoadingNext(true);
-                  const next = await api.nextQuestion(current.id);
-                  const merged = { ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer };
-                  const updatedUsed = (merged.usedQuestions ?? current.usedQuestions ?? []).length
-                    ? merged.usedQuestions ?? current.usedQuestions ?? []
-                    : [
-                        ...(current.usedQuestions ?? []),
-                        ...(merged.questionId ? [{ id: merged.questionId, title: merged.questionTitle, qType: merged.useIDE ? "coding" : "theory", codeTaskId: merged.codeTaskId, position: (current.usedQuestions?.length ?? 0) }] : []),
-                      ];
-                  setSession({ ...merged, usedQuestions: updatedUsed, total: merged.total ?? updatedUsed.length });
-                  setLoadingNext(false);
-                  setInterviewId(merged.id);
-                  setFollowUpQuestion(null);
-                  setFollowUpAnswer("");
-                  setMissingPoints([]);
-                  setBaseScore(null);
-                  setFollowLocked(false);
-                  setAnswer("");
-                  if (merged.useIDE) {
-                    const initial = codeByQuestion[merged.questionId ?? ""] ?? merged.starterCode ?? "";
-                    setCode(initial);
-                    setCodeByQuestion((prev) => {
-                      const updated = { ...prev };
-                      if (merged.questionId && !(merged.questionId in updated) && merged.starterCode) {
-                        updated[merged.questionId] = merged.starterCode;
-                      }
-                      if (typeof window !== "undefined") {
-                        try {
-                          localStorage.setItem("vibe-code-by-question", JSON.stringify(updated));
-                        } catch {
-                          // ignore
-                        }
-                      }
-                      return updated;
-                    });
-                  } else {
-                    setCode("");
+                  try {
+                    const next = await api.nextQuestion(current.id);
+                    applyNextQuestion({ ...next, startedAt: next.startedAt ?? current.startedAt, timer: next.timer ?? current.timer });
+                  } finally {
+                    setLoadingNext(false);
                   }
                 } else {
-                  const s = await api.getInterviewSession(current.id, q.id);
+                  setActiveQuestionIndex(idx);
+                  const s = await api.getInterviewSession(current.id, q.questionId);
                   const merged = { ...s, startedAt: s.startedAt ?? current.startedAt, timer: s.timer ?? current.timer };
                   setSession(merged);
                   setInterviewId(merged.id);
@@ -564,6 +566,7 @@ const currentIndex =
                   setBaseScore(null);
                   setFollowLocked(false);
                 }
+
               }}
             >
               Вопрос {idx + 1}
@@ -609,7 +612,7 @@ const currentIndex =
               <Button
                 onClick={async () => {
                   if (!current.id || !current.questionId) return;
-                  if (followUpQuestion || followLocked) {
+                  if (followUpQuestion || followLocked || answerStatus === "saving" || answerStatus === "saved") {
                     // Пока открыт follow-up или ответ уже зафиксирован — основная кнопка не активна
                     return;
                   }
@@ -649,6 +652,7 @@ const currentIndex =
                   }
                 }}
                 size="md"
+                disabled={followLocked || answerStatus === "saving" || answerStatus === "saved"}
                 className="w-1/3 min-w-[180px]"
               >
                 {answerStatus === "saving" ? "Отправляем..." : answerStatus === "saved" ? "Отправлено" : "Отправить ответ"}
@@ -666,13 +670,14 @@ const currentIndex =
                     onChange={(e) => setFollowUpAnswer(e.target.value)}
                     placeholder="Ответьте на уточняющий вопрос"
                   />
-                  <Button
-                    onClick={async () => {
-                      if (!current?.id || !current.questionId) return;
-                      try {
-                        setFollowStatus("saving");
-                      const res = await api.evalTheoryFollowup({
-                        sessionId: current.id,
+                <Button
+                  onClick={async () => {
+                    if (!current?.id || !current.questionId) return;
+                    if (followStatus === "saving" || followLocked) return;
+                    try {
+                      setFollowStatus("saving");
+                  const res = await api.evalTheoryFollowup({
+                    sessionId: current.id,
                         questionId: current.questionId,
                         ownerId: user?.id ?? "",
                         answer: followUpAnswer,

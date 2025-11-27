@@ -43,10 +43,11 @@ except Exception as exc:
 logger = logging.getLogger(__name__)
 
 
+
 def chat_completion(model: str, messages: list, **kwargs):
     """
-    Унифицированный хелпер для вызова чат-моделей.
-    По умолчанию выключаем streaming.
+    ?????????????????? ????? ???-?????? ??? ????????.
+    ?? ????????? ????????? streaming.
     """
     params = {
         "model": model,
@@ -61,29 +62,18 @@ def chat_completion(model: str, messages: list, **kwargs):
         if client is None:
             raise RuntimeError("LLM client is not initialized")
         resp = client.chat.completions.create(**params)
-        content = resp.choices[0].message.content
+        msg = resp.choices[0].message
+        if kwargs.get("response_format") and getattr(msg, "parsed", None) is not None:
+            try:
+                return json.dumps(msg.parsed, ensure_ascii=False)
+            except Exception:
+                return msg.parsed
+        content = msg.content
+        if isinstance(content, list):
+            content = "".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in content)
         return content
     except Exception as exc:
-        logger.exception(
-            "LLM chat_completion failed, using fallback stub",
-            extra={"model": model, "base_url": BASE_URL, "api_key_present": bool(api_key and api_key != 'dev-token')},
-        )
-        fallback = {
-            "question": "Резервный вопрос: расскажите, как работает HTTP/REST и чем отличаются GET/POST.",
-            "title": "HTTP/REST основы",
-            "track": "fullstack",
-            "level": "middle",
-            "estimated_answer_time_min": 3,
-            "key_points": [
-                "HTTP методы и их идемпотентность",
-                "Статусы ответа",
-                "Заголовки и тело запроса",
-                "Что такое REST и ресурсы",
-                "Кэширование и безопасность на уровне HTTP",
-            ],
-            "max_score": 10,
-        }
         fb = kwargs.get("fallback_json")
-        if fb:
+        if fb is not None:
             return fb
-        return json.dumps(fallback, ensure_ascii=False)
+        raise

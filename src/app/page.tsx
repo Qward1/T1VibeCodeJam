@@ -2,15 +2,10 @@
 import Link from "next/link";
 import { Button } from "@/components/UI/Button";
 import { Card } from "@/components/UI/Card";
-import { Badge } from "@/components/UI/Badge";
 import { useAuthStore } from "@/stores/auth";
 import { useTranslation } from "@/utils/i18n";
 
 const highlights = [
-  {
-    title: "Готов к любому backend",
-    desc: "Весь трафик идёт через единый слой services/api.ts. Подмените реализации — UI готов.",
-  },
   {
     title: "Навыковые метрики",
     desc: "Отслеживаем скорость решений, ошибки, сложность задач и формируем точный отчет",
@@ -30,8 +25,7 @@ export default function Home() {
         <div className="flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
           <div className="space-y-4 md:max-w-xl">
             
-            <h1 className="text-4xl font-bold leading-tight">{t("heroTitle")}</h1>
-            <p className="text-lg text-[var(--muted)]">{t("heroDesc")}</p>
+            <h1 className="text-4xl font-bold leading-tight">Платформа технических собеседований с использованием AI</h1>
             <div className="flex flex-wrap gap-3">
               {!user && (
                 <Link href="/auth/register">
@@ -63,17 +57,6 @@ export default function Home() {
         ))}
       </section>
 
-      <section className="glass rounded-3xl border border-[var(--border)] bg-[var(--card)]/70 p-8">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-2xl font-semibold">Минимальная связность</h2>
-            <p className="text-sm text-[var(--muted)]">UI не знает про backend. Все запросы инкапсулированы и готовы к замене.</p>
-          </div>
-          <div className="flex flex-wrap gap-3">
-            <Badge label="/services/api.ts" />
-          </div>
-        </div>
-      </section>
     </main>
   );
 }

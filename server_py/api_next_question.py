@@ -7,7 +7,14 @@ import logging
 
 from db import DB_PATH, fetchone_dict, fetchall_dicts
 from llm_theory import generate_theory_question
-from question_utils import pick_question, normalize_task_types, collect_previous_theory_topics, save_code_task_and_tests
+from question_utils import (
+    pick_question,
+    normalize_task_types,
+    collect_previous_theory_topics,
+    save_code_task_and_tests,
+    compute_adaptive_level,
+    apply_adaptive_from_history,
+)
 from llm_code import generate_code_task, build_tests_for_task, _fallback_code_task
 import uuid as _uuid
 
@@ -28,6 +35,24 @@ def sanitize_starter_code(task: dict) -> str:
     if not sig.endswith(":"):
         sig = sig + ":"
     return f"{sig}\n    # TODO: реализуйте функцию\n    pass\n"
+
+
+def _retry_llm(fn, attempts: int = 12, delay: float = 0.6):
+    last_err = None
+    for _ in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            try:
+                import time
+
+                time.sleep(delay)
+            except Exception:
+                pass
+    if last_err:
+        raise last_err
+    raise RuntimeError("retry failed without exception")
 
 
 def next_question_legacy(payload: dict):
@@ -82,6 +107,8 @@ def next_question(payload: dict):
         conn.close()
         raise HTTPException(status_code=404, detail="not_found")
 
+    current_level, target_max_score = apply_adaptive_from_history(cur, session)
+
     task_types = normalize_task_types(session.get("tasks", "").split(",") if session.get("tasks") else [])
     issued_rows = fetchall_dicts(
         cur.execute(
@@ -89,6 +116,10 @@ def next_question(payload: dict):
             (sessionId,),
         )
     )
+    try:
+        limit = int(session.get("total") or 1)
+    except Exception:
+        limit = 1
     try:
         limit = int(session.get("total") or 1)
     except Exception:
@@ -101,14 +132,10 @@ def next_question(payload: dict):
             conn.commit()
         except Exception:
             pass
-    # Если лимит исчерпан, увеличиваем total и продолжаем, чтобы сформировать следующий вопрос
+    # Если лимит исчерпан — новых вопросов не выдаем
     if len(issued_rows) >= limit:
-        limit = len(issued_rows) + 1
-        try:
-            cur.execute("UPDATE sessions SET total=? WHERE id=?", (limit, sessionId))
-            conn.commit()
-        except Exception:
-            pass
+        conn.close()
+        raise HTTPException(status_code=404, detail="limit_reached")
 
     # В режиме теории+кода: сначала 6 теоретических, затем 4 кодовых
     theory_count = sum(1 for r in issued_rows if (r.get("q_type") or "").lower() == "theory")
@@ -160,22 +187,20 @@ def next_question(payload: dict):
             prev_algo, prev_domain = collect_previous_code_topics(
                 cur, sessionId, (session.get("direction") or "fullstack").lower()
             )
-            q_obj = generate_code_task(
-                (session.get("direction") or "fullstack").lower(),
-                (session.get("level") or "middle").lower(),
-                category,
-                "python",
-                prev_algo,
-                prev_domain,
+            q_obj = _retry_llm(
+                lambda: generate_code_task(
+                    (session.get("direction") or "fullstack").lower(),
+                    current_level,
+                    category,
+                    "python",
+                    prev_algo,
+                    prev_domain,
+                )
             )
         except Exception as exc:
             logger.exception("LLM generation failed on next_question coding", extra={"direction": session.get("direction"), "level": session.get("level")})
-            q_obj = _fallback_code_task(
-                (session.get("direction") or "fullstack").lower(),
-                (session.get("level") or "middle").lower(),
-                category,
-                "python",
-            )
+            conn.close()
+            raise HTTPException(status_code=503, detail="llm_unavailable")
         try:
             code_task_id = q_obj.get("task_id") or f"code-{_uuid.uuid4()}"
             # Вычисляем expected и сохраняем тесты
@@ -186,26 +211,66 @@ def next_question(payload: dict):
             description = q_obj.get("description_markdown", "")
             use_ide = True
             starter_code = sanitize_starter_code(q_obj)
-            meta_json = json.dumps({**q_obj, "task_id": code_task_id, "starter_code": starter_code}, ensure_ascii=False)
+            meta_json = json.dumps(
+                {
+                    **q_obj,
+                    "task_id": code_task_id,
+                    "starter_code": starter_code,
+                    "target_max_score": target_max_score,
+                    "target_level": current_level,
+                },
+                ensure_ascii=False,
+            )
             desired_type = "coding"
             starter_code = starter_code
             function_signature = q_obj.get("function_signature")
         except Exception as exc:
             logger.exception("Failed to build/save coding question", extra={"direction": session.get("direction"), "level": session.get("level")})
             question_id = None
+        if not question_id:
+            try:
+                q = pick_question(cur, session.get("direction"), current_level, ["coding"], [])
+                if q:
+                    question_id = q["id"]
+                    question_title = q.get("title") or "Кодинговая задача"
+                    description = q.get("statement") or ""
+                    use_ide = bool(q.get("useIDE", 1))
+                    meta_json = json.dumps(q, ensure_ascii=False)
+                    desired_type = "coding"
+            except Exception:
+                question_id = None
     if desired_type == "theory":
         try:
             prev_topics = collect_previous_theory_topics(cur, sessionId)
-            q_obj = generate_theory_question((session.get("direction") or "fullstack").lower(), (session.get("level") or "middle").lower(), prev_topics)
+            prev_topics_l = [t.lower() for t in prev_topics]
+            q_obj = None
+            for _ in range(3):
+                cand = _retry_llm(
+                    lambda: generate_theory_question((session.get("direction") or "fullstack").lower(), current_level, prev_topics)
+                )
+                topic_val = (cand.get("title") or cand.get("question") or cand.get("topic") or "").strip().lower()
+                if topic_val and topic_val in prev_topics_l:
+                    continue
+                q_obj = cand
+                break
+            if q_obj is None:
+                q_obj = _retry_llm(
+                    lambda: generate_theory_question((session.get("direction") or "fullstack").lower(), current_level, prev_topics)
+                )
+            q_obj["max_score"] = target_max_score
             question_id = f"llm-theory-{uuid.uuid4()}"
             question_title = q_obj.get("title") or (q_obj.get("question") or "Теоретический вопрос")[0:60]
             description = q_obj.get("question", "")
             use_ide = False
-            meta_json = json.dumps(q_obj, ensure_ascii=False)
+            meta_json = json.dumps(
+                {**q_obj, "target_max_score": target_max_score, "target_level": current_level},
+                ensure_ascii=False,
+            )
             desired_type = "theory"
         except Exception as exc:
             logger.exception("LLM generation failed on next_question", extra={"direction": session.get("direction"), "level": session.get("level")})
-            question_id = None
+            conn.close()
+            raise HTTPException(status_code=503, detail="llm_unavailable")
     if not question_id:
         conn.close()
         raise HTTPException(status_code=404, detail="no_questions")
@@ -268,7 +333,9 @@ def next_question(payload: dict):
             "starterCode": starter_code or session.get("starterCode"),
             "description": description,
             "direction": session.get("direction"),
-            "level": session.get("level"),
+            "level": session.get("adaptive_level") or session.get("level"),
+            "adaptiveLevel": session.get("adaptive_level") or current_level,
+            "adaptiveMaxScore": target_max_score,
             "format": session.get("format"),
             "tasks": session.get("tasks", "").split(",") if session.get("tasks") else [],
             "timer": session.get("timer"),

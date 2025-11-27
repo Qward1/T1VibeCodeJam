@@ -29,6 +29,8 @@ __pycache__
 
 # SQLite data
 data/api.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
 
 # Misc
 *.swp

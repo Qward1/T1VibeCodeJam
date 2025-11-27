@@ -238,6 +238,20 @@ def ensure_schema():
         cur.execute("ALTER TABLE sessions ADD COLUMN is_finished INTEGER DEFAULT 0")
     if "assignedId" not in session_cols:
         cur.execute("ALTER TABLE sessions ADD COLUMN assignedId TEXT")
+    if "initial_level" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN initial_level TEXT")
+    if "adaptive_level" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN adaptive_level TEXT")
+    if "adaptive_max_score" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN adaptive_max_score INTEGER")
+
+    if "initial_level" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN initial_level TEXT")
+    if "adaptive_level" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN adaptive_level TEXT")
+    if "adaptive_max_score" not in session_cols:
+        cur.execute("ALTER TABLE sessions ADD COLUMN adaptive_max_score INTEGER")
+
     message_cols = [c[1] for c in cur.execute("PRAGMA table_info(messages)").fetchall()]
     if "questionId" not in message_cols:
         cur.execute("ALTER TABLE messages ADD COLUMN questionId TEXT")
@@ -339,6 +353,8 @@ def ensure_schema():
         cur.execute("ALTER TABLE session_questions ADD COLUMN is_finished INTEGER DEFAULT 0")
     if "hints_used" not in sq_cols:
         cur.execute("ALTER TABLE session_questions ADD COLUMN hints_used INTEGER DEFAULT 0")
+    if "adaptive_applied" not in sq_cols:
+        cur.execute("ALTER TABLE session_questions ADD COLUMN adaptive_applied INTEGER DEFAULT 0")
     # Добавляем недостающие колонки в session_questions
     sq_cols = [c[1] for c in cur.execute("PRAGMA table_info(session_questions)").fetchall()]
     if "meta_json" not in sq_cols:

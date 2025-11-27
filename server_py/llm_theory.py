@@ -44,6 +44,44 @@ class TheoryDecision(str, Enum):
     CLARIFY = "clarify"
 
 
+def _safe_chat(model: str, messages: list, temperature: float, max_tokens: int, fallback_json: str | None = None, response_format=None):
+    last_err = None
+    for attempt in range(8):
+        try:
+            return chat_completion(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            try:
+                import time
+
+                time.sleep(0.4 * (attempt + 1))
+            except Exception:
+                pass
+    if fallback_json is not None:
+        return fallback_json
+    if last_err:
+        raise last_err
+    raise RuntimeError("LLM chat failed without exception")
+
+
+def _extract_or_fallback(raw, fallback_json: str):
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return extract_json(raw)
+    except Exception:
+        try:
+            return json.loads(fallback_json)
+        except Exception:
+            return {}
+
+
 def extract_json(raw: str) -> dict:
     """
     Вырезает первый JSON-объект из строки, обрезая <think> и markdown-обёртки.
@@ -168,17 +206,15 @@ def generate_theory_question(track: str, level: str, previous_topics: list[str] 
         },
         ensure_ascii=False,
     )
-    raw = chat_completion(
+    raw = _safe_chat(
         model="qwen3-32b-awq",
         messages=messages,
         temperature=0.4,
         max_tokens=800,
         fallback_json=fallback_json,
+        response_format={"type": "json_object"},
     )
-    try:
-        data = extract_json(raw)
-    except Exception:
-        data = json.loads(fallback_json)
+    data = _extract_or_fallback(raw, fallback_json)
     if not data.get("title"):
         data["title"] = "Теоретический вопрос"
     return data
@@ -262,13 +298,28 @@ def evaluate_theory_answer(question_obj: dict, candidate_answer: str) -> dict:
         {"role": "system", "content": SYSTEM_PROMPT_EVAL_THEORY},
         {"role": "user", "content": build_user_prompt_eval_theory(question_obj, candidate_answer)},
     ]
-    raw = chat_completion(
+    fallback_json = json.dumps(
+        {
+            "score": 0,
+            "max_score": question_obj.get("max_score", 10),
+            "verdict": "fail",
+            "covered_points": [],
+            "missing_points": [],
+            "feedback_short": "",
+            "feedback_detailed": "",
+            "suggested_next_difficulty": "same",
+        },
+        ensure_ascii=False,
+    )
+    raw = _safe_chat(
         model="qwen3-32b-awq",
         messages=messages,
         temperature=0.1,
         max_tokens=800,
+        fallback_json=fallback_json,
+        response_format={"type": "json_object"},
     )
-    data = extract_json(raw)
+    data = _extract_or_fallback(raw, fallback_json)
     data["score"] = int(data.get("score", 0))
     data["max_score"] = int(data.get("max_score", question_obj.get("max_score", 10)))
     return data
@@ -324,14 +375,16 @@ def generate_followup_question(question_obj: dict, missing_points: List[str], ca
         {"role": "system", "content": SYSTEM_PROMPT_FOLLOWUP},
         {"role": "user", "content": build_user_prompt_followup(question_obj, missing_points, candidate_answer)},
     ]
-    raw = chat_completion(
+    fallback_json = json.dumps({"follow_up_question": ""}, ensure_ascii=False)
+    raw = _safe_chat(
         model="qwen3-32b-awq",
         messages=messages,
         temperature=0.3,
         max_tokens=400,
+        fallback_json=fallback_json,
+        response_format={"type": "json_object"},
     )
-    data = extract_json(raw)
-    return data
+    return _extract_or_fallback(raw, fallback_json)
 
 
 SYSTEM_PROMPT_EVAL_FOLLOWUP = """
@@ -395,13 +448,25 @@ def evaluate_followup_answer(question_obj: dict, missing_points: List[str], foll
         {"role": "system", "content": SYSTEM_PROMPT_EVAL_FOLLOWUP},
         {"role": "user", "content": build_user_prompt_eval_followup(question_obj, missing_points, follow_up_question, follow_up_answer, max_score_followup)},
     ]
-    raw = chat_completion(
+    fallback_json = json.dumps(
+        {
+            "score": 0,
+            "max_score": max_score_followup,
+            "covered_points": [],
+            "missing_points_still": missing_points,
+            "feedback_short": "",
+        },
+        ensure_ascii=False,
+    )
+    raw = _safe_chat(
         model="qwen3-32b-awq",
         messages=messages,
         temperature=0.1,
         max_tokens=500,
+        fallback_json=fallback_json,
+        response_format={"type": "json_object"},
     )
-    data = extract_json(raw)
+    data = _extract_or_fallback(raw, fallback_json)
     data["score"] = int(data.get("score", 0))
     data["max_score"] = int(data.get("max_score", max_score_followup))
     return data
