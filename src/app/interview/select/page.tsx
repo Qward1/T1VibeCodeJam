@@ -106,7 +106,6 @@ export default function SelectPage() {
     <main className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <div className="text-sm text-[var(--muted)]">Шаг 1</div>
           <h1 className="text-3xl font-semibold">Выбор темы собеседования</h1>
         </div>
         <Button onClick={handleStart} disabled={mutation.isPending}>

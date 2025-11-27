@@ -3,6 +3,7 @@ from pathlib import Path
 import hashlib
 import shutil
 import logging
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -56,6 +57,35 @@ def connect():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(DB_PATH)
 
+
+def seed_superadmin(cur):
+    """
+    Создаёт супер-админа admin@local/admin, если ещё нет админа/суперадмина.
+    """
+    try:
+        exists = cur.execute("SELECT id FROM users WHERE role='superadmin' OR admin=1 LIMIT 1").fetchone()
+        if exists:
+            return
+        user_id = str(uuid.uuid4())
+        cur.execute(
+            """
+            INSERT INTO users (id, email, name, password, level, role, admin, lang)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                "admin@local",
+                "Super Admin",
+                sha1("admin"),
+                "senior",
+                "superadmin",
+                1,
+                "ru",
+            ),
+        )
+        logger.info("Seeded default superadmin", extra={"email": "admin@local"})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to seed superadmin", extra={"err": str(exc)})
 
 def seed_questions(cur, force: bool = False):
     """Заглушка: больше не сидируем вопросы автоматически."""
@@ -437,6 +467,8 @@ def ensure_schema():
     )
     # Связь сессии с назначением
     session_cols = [c[1] for c in cur.execute("PRAGMA table_info(sessions)").fetchall()]
+    # Супер-админ по умолчанию
+    seed_superadmin(cur)
     conn.commit()
     conn.close()
 

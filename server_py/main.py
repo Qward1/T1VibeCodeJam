@@ -1,7 +1,7 @@
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel
@@ -296,7 +296,7 @@ def _prepare_runner_input(raw_input, param_count: Optional[int]):
     return [raw_input]
 
 
-def _prepare_runner_tests(rows: List[dict], param_count: Optional[int]) -> List[dict]:
+def _prepare_runner_tests(rows: List[dict], param_count: Optional[int], task: Optional[dict] = None) -> List[dict]:
     tests = []
     for idx, row in enumerate(rows):
         name = row.get("name") or f"test_{idx+1}"
@@ -308,6 +308,11 @@ def _prepare_runner_tests(rows: List[dict], param_count: Optional[int]) -> List[
             expected = json.loads(row.get("expected_json") or "null")
         except Exception:
             expected = None
+        # Если expected отсутствует или подозрительно совпадает с входом, пробуем вычислить по эталону
+        if (expected is None or expected == raw_input) and task is not None:
+            computed = _compute_expected_with_reference(task, raw_input if isinstance(raw_input, list) else [raw_input])
+            if computed is not None:
+                expected = computed
         tests.append(
             {
                 "name": name,
@@ -2185,6 +2190,16 @@ def admin_overview(adminId: str):
             )
         )
         last_score = res.get("score") if res else 0
+        last_report = fetchone_dict(
+            cur.execute(
+                """
+                SELECT id FROM interview_reports
+                WHERE (ownerId=? OR owner_id=?)
+                ORDER BY datetime(createdAt) DESC LIMIT 1
+                """,
+                (u["id"], u["id"]),
+            )
+        )
         candidates.append(
             {
                 "id": u["id"],
@@ -2197,6 +2212,7 @@ def admin_overview(adminId: str):
                 "flagsCount": flags.get(u["id"], 0),
                 "lastScore": last_score or 0,
                 "lastTopic": "Собеседование",
+                "lastReportId": last_report.get("id") if last_report else None,
             }
         )
     conn.close()
@@ -2383,15 +2399,158 @@ def _tests_from_runner(run_result: dict) -> List[dict]:
         status = "passed" if t.get("passed") else "failed"
         if t.get("error"):
             status = "error"
+        # Берём фактический вывод функции, а не вход
+        actual_val = t.get("output")
+        if actual_val is None and "actual" in t:
+            actual_val = t.get("actual")
         out.append(
             {
                 "name": t.get("name"),
                 "status": status,
                 "expected": t.get("expected"),
-                "actual": t.get("output"),
+                "actual": actual_val,
             }
         )
     return out
+
+
+def _compute_expected_with_reference(task: dict, args: List) -> Optional[Any]:
+    """
+    Вычисляет expected через эталонное python-решение.
+    Берёт python-вариант из language_variants (если есть) либо поля task,
+    запускает его в отдельном процессе и парсит stdout как JSON.
+    """
+    try:
+        variants = task.get("language_variants") or {}
+        py_variant = variants.get("python") or {}
+
+        signature = py_variant.get("function_signature") or task.get("function_signature")
+        ref_code = py_variant.get("reference_solution") or task.get("reference_solution")
+
+        # Если нет сигнатуры или эталонного кода — просто ничего не считаем
+        if not signature or not ref_code:
+            return None
+
+        fn_name = parse_function_name(signature)
+        if not fn_name:
+            return None
+
+        # Пишем эталонное решение во временный файл
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".py", encoding="utf-8") as tmp:
+            code_path = tmp.name
+            tmp.write(ref_code)
+
+        try:
+            runner = f"""
+import json, importlib.util, sys
+
+code_path = r"{code_path}"
+
+spec = importlib.util.spec_from_file_location("ref_code", code_path)
+mod = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(mod)
+fn = getattr(mod, "{fn_name}")
+args = json.loads(sys.argv[1])
+res = fn(*args) if isinstance(args, list) else fn(args)
+print(json.dumps(res, ensure_ascii=False))
+"""
+
+            proc = subprocess.run(
+                [sys.executable, "-c", runner, json.dumps(args, ensure_ascii=False)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode != 0:
+                logger.warning(
+                    "reference solution returned non-zero exit code",
+                    extra={
+                        "task_id": task.get("task_id"),
+                        "stderr": proc.stderr,
+                    },
+                )
+                return None
+
+            out = proc.stdout.strip()
+            if not out:
+                return None
+
+            return json.loads(out)
+        finally:
+            try:
+                os.remove(code_path)
+            except Exception:
+                pass
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "failed to compute expected with reference",
+            extra={
+                "task_id": task.get("task_id"),
+                "input": args,
+                "error": str(exc),
+            },
+        )
+        return None
+
+
+
+
+
+def _ensure_expected_outputs(task: dict, tests: List[dict], param_count: Optional[int]) -> List[dict]:
+    """
+    Гарантирует, что в тестах заполнено корректное expected.
+
+    Логика:
+    - Если expected уже есть и НЕ равен input — оставляем как есть.
+    - Если expected нет или он равен input (подозрительно) —
+      пытаемся взять правильный ответ из поля expected_json (то, что хранится в БД).
+    - НИКАКИХ вычислений через reference_solution здесь больше нет.
+    """
+    updated: List[dict] = []
+
+    for t in tests:
+        inp = t.get("input") or []
+        exp = t.get("expected")
+
+        # 1) Нормальный expected уже есть — не трогаем
+        if exp is not None and exp != inp:
+            updated.append(t)
+            continue
+
+        # 2) Пытаемся восстановить expected из expected_json (то, что ты уже посчитал заранее)
+        exp_json = t.get("expected_json")
+        if exp_json is not None:
+            try:
+                # expected_json может быть уже объектом или строкой JSON
+                if isinstance(exp_json, str):
+                    exp_val = json.loads(exp_json)
+                else:
+                    exp_val = exp_json
+                t = {**t, "expected": exp_val}
+            except Exception as e:
+                logger.warning(
+                    "failed to load expected from expected_json",
+                    extra={
+                        "task_id": task.get("task_id"),
+                        "test_name": t.get("name"),
+                        "error": str(e),
+                    },
+                )
+                # если не смогли распарсить — оставляем expected = None
+                t = {**t, "expected": None}
+        else:
+            # если старый expected совпадал с input — явно кривой тест, обнуляем
+            if exp == inp:
+                t = {**t, "expected": None}
+
+        updated.append(t)
+
+    return updated
+
+
 
 
 def _save_error_hint(cur, session_id: str, question_id: str, owner_id: str, hint: str):
@@ -2457,7 +2616,8 @@ def code_run_samples(payload: RunSamplesPayload):
         if not function_name:
             return {"tests": [], "hasError": True, "error": "function_not_found"}
         param_count = _param_count(signature)
-        runner_tests = _prepare_runner_tests(public_tests, param_count)
+        public_tests = _ensure_expected_outputs(task, public_tests, param_count)
+        runner_tests = _prepare_runner_tests(public_tests, param_count, task)
         run_result = None
         last_error = None
         chosen_lang = payload.language
@@ -2515,7 +2675,9 @@ def code_check(payload: CheckCodePayload):
         if not function_name:
             raise HTTPException(status_code=400, detail="function_not_found")
         param_count = _param_count(signature)
-        runner_public = _prepare_runner_tests(public_tests, param_count)
+        public_tests = _ensure_expected_outputs(task, public_tests, param_count)
+        hidden_tests = _ensure_expected_outputs(task, hidden_tests, param_count)
+        runner_public = _prepare_runner_tests(public_tests, param_count, task)
         lang_candidates = _candidate_languages(task, payload.language)
         hints_used = _get_hints_used(cur, payload.sessionId, payload.questionId)
         base_max = _base_max_score(task)
@@ -2601,7 +2763,7 @@ def code_check(payload: CheckCodePayload):
                         "hintsUsed": hints_used,
                     }
                 else:
-                    runner_hidden = _prepare_runner_tests(hidden_tests, param_count)
+                    runner_hidden = _prepare_runner_tests(hidden_tests, param_count, task)
                     hidden_result = None
                     last_hidden_err = None
                     for lang in lang_candidates:
@@ -2899,7 +3061,10 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
         conn.close()
         return get_session(session_id)
     # Подготавливаем первый вопрос с учётом фильтров назначения
+    # Типы задач: если не задано при назначении — используем стандартный сценарий
     task_types = normalize_task_types((assigned.get("tasks") or "").split(",") if assigned.get("tasks") else [])
+    if not task_types:
+        task_types = ["coding", "theory"]
 
     question_id = None
     question_title = "Вопрос 1"
@@ -2912,12 +3077,20 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
     code_task_id = None
     function_signature = None
 
-    task_types = normalize_task_types((assigned.get("tasks") or "").split(",") if assigned.get("tasks") else [])
+    session_id = str(uuid.uuid4())
+    dual_mode = "coding" in task_types and "theory" in task_types
 
-    # Сначала пробуем coding, если выбран
-    if "coding" in task_types:
+    # Сначала пробуем coding, если выбран и не дуальный режим (как в start_interview)
+    if "coding" in task_types and not dual_mode:
         try:
-            q_obj = generate_unique_code_task(cur, assigned.get("sessionId") or session_id, (assigned.get("direction") or "fullstack").lower(), (assigned.get("level") or "middle").lower(), "algo", "python")
+            q_obj = generate_unique_code_task(
+                cur,
+                assigned.get("sessionId") or session_id,
+                (assigned.get("direction") or "fullstack").lower(),
+                (assigned.get("level") or "middle").lower(),
+                "algo",
+                "python",
+            )
             code_task_id = _session_task_id(q_obj.get("task_id"), assigned.get("sessionId") or session_id)
             public_tests, hidden_tests = build_tests_for_task(q_obj)
             save_code_task_and_tests(cur, code_task_id, q_obj, public_tests, hidden_tests)
@@ -2926,9 +3099,9 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
             description = q_obj.get("description_markdown", "")
             question_type = "coding"
             use_ide = True
-            starter = q_obj.get("starter_code", "")
+            starter = sanitize_starter_code(q_obj)
             function_signature = q_obj.get("function_signature")
-            meta_json = json.dumps({**q_obj, "task_id": code_task_id}, ensure_ascii=False)
+            meta_json = json.dumps({**q_obj, "task_id": code_task_id, "starter_code": starter}, ensure_ascii=False)
         except Exception as exc:
             logger.exception("LLM coding generation failed on assigned-interview start", extra={"direction": assigned.get("direction"), "level": assigned.get("level")})
             question_id = None
@@ -2950,7 +3123,7 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
             question_id = None
 
     # Если теорию не удалось — пробуем coding как фолбэк
-    if not question_id:
+    if not question_id and "coding" in task_types:
         q = pick_question(cur, assigned.get("direction"), assigned.get("level"), ["coding"], [])
         if q:
             question_id = q["id"]
@@ -2966,8 +3139,7 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
         )
         conn.close()
         raise HTTPException(status_code=404, detail="no_questions")
-    total_questions = 9 if dual_mode else 1
-    session_id = str(uuid.uuid4())
+    total_questions = 10 if dual_mode else 1
     starter = starter if question_type != "theory" else ""
     started_at = now_iso()
     timer_val = TIMER_SECONDS
@@ -2990,7 +3162,7 @@ def start_assigned_interview(assigned_id: str, payload: AssignedStartPayload):
             assigned.get("direction"),
             assigned.get("level"),
             assigned.get("format") or "Full interview",
-            ",".join(["theory"]),
+            ",".join(task_types),
             description,
             starter,
             timer_val,

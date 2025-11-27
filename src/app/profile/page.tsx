@@ -2,11 +2,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "@/services/api";
 import { Card } from "@/components/UI/Card";
-import { RadarChart } from "@/components/Charts/RadarChart";
-import { Heatmap } from "@/components/Charts/Heatmap";
-import { Sparkline } from "@/components/Charts/Sparkline";
 import { Badge } from "@/components/UI/Badge";
-import { StatCard } from "@/components/UI/StatCard";
 import { formatDate } from "@/utils";
 import { Button } from "@/components/UI/Button";
 import { Switch } from "@/components/UI/Switch";
@@ -44,33 +40,9 @@ export default function ProfilePage() {
           <h1 className="text-3xl font-semibold">{profile?.user.name ?? "Загрузка"}</h1>
           <div className="flex gap-2 text-sm text-[var(--muted)]">
             <span>{profile?.user.email}</span>
-            <span>•</span>
-            <span>{profile?.user.level}</span>
           </div>
         </div>
-        <div className="flex gap-2">
-          <Badge label="Стабильность" tone="info" />
-          <Badge label="Заданий решено: 48" tone="neutral" />
-        </div>
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Card title="Навыки">
-          {profile && <RadarChart data={profile.stats.skillMap} />}
-        </Card>
-        <Card title="Ошибки">
-          {profile && <Heatmap data={profile.stats.errorHeatmap} />}
-        </Card>
-        <Card title="Среднее время решения">
-          {profile && (
-            <div className="flex flex-col gap-4">
-              <div className="text-4xl font-semibold">{profile.stats.avgSolveTime} мин</div>
-              <Sparkline
-                points={profile.stats.skillMap.map((s, idx) => ({ label: s.label, value: s.value - idx * 5 }))}
-              />
-            </div>
-          )}
-        </Card>
+        <div className="flex gap-2" />
       </div>
 
       <Card title="История собеседований">

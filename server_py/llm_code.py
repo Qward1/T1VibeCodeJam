@@ -8,14 +8,40 @@ import subprocess
 import sys
 import ast
 
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://llm.t1v.scibox.tech/v1",
+    api_key='sk-bJoOnZIeHtnYoiEjq897YA',
+)
+
 try:
-    from .llm_client import chat_completion  # type: ignore
     from .llm_theory import extract_json  # type: ignore
 except Exception:
-    from llm_client import chat_completion  # type: ignore
-    from llm_theory import extract_json  # type: ignore
+    try:
+        from llm_theory import extract_json  # type: ignore
+    except Exception:
+        extract_json = None  # type: ignore
+
+
+def chat_completion(
+    model: str,
+    messages: list[dict],
+    temperature: float = 0.3,
+    max_tokens: int = 900,
+) -> str:
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content  # type: ignore[return-value]
+
 
 logger = logging.getLogger(__name__)
+ 
 ERROR_MENTOR_SYSTEM = """
 /no_think Ты — доброжелательный ментор по программированию.
 
@@ -199,6 +225,7 @@ SYSTEM_PROMPT_GENERATE_CODE_TASK = """
 """
 
 
+
 def build_user_prompt_generate_code_task(
     track: str,
     level: str,
@@ -279,46 +306,16 @@ def generate_code_task(
     language: str,
     previous_algo_topics: Optional[List[str]] = None,
     previous_domain_topics: Optional[List[str]] = None,
-) -> dict:
-    def _parse_llm_json(raw_str: str) -> dict:
-        text = raw_str.strip()
-        fence = re.match(r"```(?:json)?(.*)```", text, re.S)
-        if fence:
-            text = fence.group(1).strip()
+    ) -> dict:
+    def _parse_llm_json(raw: str) -> dict:
+    
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError("JSON not found")
+        return json.loads(raw[start:end + 1])
 
-        def _loads_safe(snippet: str):
-            cleaned = re.sub(r",(\s*[}\]])", r"\1", snippet)  # убираем висячие запятые
-        try:
-            return json.loads(cleaned)
-        except Exception:
-            pass
-        # Расширенный парсер: переводим JSON-подобную строку в python-литерал
-        try:
-            py_like = (
-                cleaned.replace("null", "None")
-                .replace("true", "True")
-                .replace("false", "False")
-            )
-            return ast.literal_eval(py_like)
-        except Exception:
-            # Если не смогли корректно распарсить – вернём None, чтобы сработал fallback
-            return None
-
-        try:
-            return extract_json(text)
-        except Exception:
-            pass
-        m = re.search(r"\{.*\}", text, re.S)
-        if m:
-            parsed = _loads_safe(m.group(0))
-            if parsed:
-                return parsed
-        if "{" in text and "}" in text:
-            first, last = text.find("{"), text.rfind("}")
-            parsed = _loads_safe(text[first : last + 1])
-            if parsed:
-                return parsed
-        return None
+        
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_GENERATE_CODE_TASK},
@@ -330,23 +327,34 @@ def generate_code_task(
         },
     ]
     try:
-        raw = chat_completion(
-            model="qwen3-32b-awq",
+        raw = client.chat.completions.create(
+            model="qwen3-coder-30b-a3b-instruct-fp8",
             messages=messages,
-            temperature=0.3,
-            max_tokens=900,
-        )
-        logger.info("LLM code task raw response", extra={"track": track, "level": level, "category": category})
+            temperature=0.4,
+            max_tokens=2000,
+        ).choices[0].message.content
         if not raw or not isinstance(raw, str):
             raise ValueError("empty_llm_response")
-        data = _parse_llm_json(raw)
-        if not data:
-            logger.warning("LLM code task parse attempt failed, using fallback", extra={"track": track, "level": level, "category": category})
+
+        try:
+            data = _parse_llm_json(raw)
+        except Exception as e:
+            logger.warning(
+                "LLM code task parse attempt failed, using fallback",
+                extra={"track": track, "level": level, "category": category, "error": str(e)},
+            )
             return _fallback_code_task(track, level, category, language)
-        logger.info("LLM code task parsed", extra={"task_id": data.get("task_id"), "title": data.get("title")})
+
+        logger.info(
+            "LLM code task parsed",
+            extra={"task_id": data.get("task_id"), "title": data.get("title")},
+        )
         return data
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("LLM code task generation failed, using fallback", extra={"track": track, "level": level, "category": category, "error": str(exc)})
+    except Exception as exc:
+        logger.exception(
+            "LLM code task generation failed, using fallback",
+            extra={"track": track, "level": level, "category": category, "error": str(exc)},
+        )
         return _fallback_code_task(track, level, category, language)
 
 
@@ -354,7 +362,7 @@ def explain_code_error(language: str, function_signature: str, user_code: str, e
     """LLM-подсказка по ошибке исполнения кода пользователя."""
     try:
         raw = chat_completion(
-            model="qwen3-coder-30b-a3b-instruct-fp8",
+            model="qwen3-32b-awq",
             messages=[
                 {"role": "system", "content": ERROR_MENTOR_SYSTEM},
                 {"role": "user", "content": build_user_prompt_code_error(language, function_signature, user_code, error_text)},
@@ -373,7 +381,7 @@ def generate_code_hint(task: dict, user_code: Optional[str], hint_level: int, pr
     """LLM-подсказка по задаче без раскрытия решения."""
     try:
         raw = chat_completion(
-            model="qwen3-coder-30b-a3b-instruct-fp8",
+            model="qwen3-32b-awq",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_CODE_HINT},
                 {"role": "user", "content": build_user_prompt_code_hint(task, user_code, hint_level, previous_hints)},

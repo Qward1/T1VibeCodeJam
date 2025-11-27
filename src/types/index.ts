@@ -115,6 +115,7 @@ export type Candidate = {
   role?: "user" | "admin" | "superadmin";
   hasFlags?: boolean;
   flagsCount?: number;
+  lastReportId?: string | null;
 };
 
 export type FlaggedEvent = {

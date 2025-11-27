@@ -59,8 +59,8 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         sessionId: current.id,
         questionId: current.questionId,
         taskId: current.codeTaskId,
-        code,
-        language: current.language || "python",
+        code: activeCode,
+        language: selectedLanguage || current.language || "python",
         ownerId: user?.id,
       });
     },
@@ -92,6 +92,10 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       if (current?.questionId) {
         setCheckResultsByQuestion((prev) => ({ ...prev, [current.questionId!]: { passed, summary, cases } }));
         setLastTestKindByQuestion((prev) => ({ ...prev, [current.questionId!]: "check" }));
+        // фиксируем результат по вопросу: если решено или 3 попытки — блокируем кнопки
+        if (passed || attemptNum >= 3) {
+          setLockRunCheck((prev) => ({ ...prev, [current.questionId!]: true }));
+        }
       }
       setTestResult({ passed, summary, cases });
       setLastTestKind("check");
@@ -105,16 +109,9 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         });
       }
       lastTestAt.current = now;
-      // Если бэкенд вернул новый вопрос — добавляем кнопку
-      if (shouldLoadNext) {
-        if (result?.nextQuestion) {
-          applyNextQuestion(result.nextQuestion);
-        } else if (current?.id) {
-          api
-            .nextQuestion(current.id)
-            .then(applyNextQuestion)
-            .catch((e) => console.warn("nextQuestion fallback failed", e));
-        }
+      // Если бэкенд вернул новый вопрос — добавляем кнопку (не переключаемся автоматически)
+      if (shouldLoadNext && result?.nextQuestion) {
+        applyNextQuestion(result.nextQuestion);
       }
     },
   });
@@ -125,8 +122,8 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         sessionId: current.id,
         questionId: current.questionId,
         taskId: current.codeTaskId,
-        code,
-        language: current.language || "python",
+        code: activeCode,
+        language: selectedLanguage || current.language || "python",
         ownerId: user?.id,
       });
     },
@@ -179,6 +176,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   >({});
   const [runResultsByQuestion, setRunResultsByQuestion] = useState<Record<string, any>>({});
   const [lastTestKindByQuestion, setLastTestKindByQuestion] = useState<Record<string, "check" | "run">>({});
+  const [lockRunCheck, setLockRunCheck] = useState<Record<string, boolean>>({});
   const hintMutation = useMutation({
     mutationFn: async () => {
       if (!current?.id || !current?.questionId || !current?.codeTaskId || !user?.id) throw new Error("missing_params");
@@ -188,7 +186,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
         taskId: current.codeTaskId,
         language: selectedLanguage || current.language || "python",
         ownerId: user.id,
-        userCode: code,
+        userCode: activeCode,
       });
     },
     onSuccess: () => {
@@ -224,12 +222,21 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       setCodeByQuestion({});
     }
   }, [storageKey]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(codeByQuestion));
+    } catch {
+      // ignore write errors (e.g., private mode)
+    }
+  }, [codeByQuestion, storageKey]);
   type QuestionTab = { questionId?: string; title?: string; qType?: string; codeTaskId?: string; isUnlocked: boolean };
   const [questionTabs, setQuestionTabs] = useState<QuestionTab[]>([{ isUnlocked: true }]);
   const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
   const currentIndex = activeQuestionIndex;
   const usedCount = questionTabs.length;
   const totalCount = usedCount;
+  const lastQuestionIdRef = useRef<string | null>(null);
   // гарантируем, что текущий вопрос всегда присутствует в списке usedQuestions
   useEffect(() => {
     if (!current?.questionId) return;
@@ -331,7 +338,10 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
       return arr;
     });
     const idx = current.usedQuestions?.findIndex((q) => q.id === current.questionId);
-    if (idx !== undefined && idx >= 0) setActiveQuestionIndex(idx);
+    if (idx !== undefined && idx >= 0 && lastQuestionIdRef.current !== current.questionId) {
+      setActiveQuestionIndex(idx);
+      lastQuestionIdRef.current = current.questionId ?? null;
+    }
   }, [current?.id, current?.questionId, current?.usedQuestions, current?.total]);
 
   useEffect(() => {
@@ -381,8 +391,16 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
     const saved = codeByQuestion[current.questionId];
     if (saved !== undefined) {
       setCode(saved);
+      return;
     }
-  }, [codeByQuestion, current?.questionId, current?.useIDE, setCode]);
+    // нет сохранённого кода — подставляем starterCode и сохраняем локально
+    if (current.starterCode) {
+      setCode(current.starterCode);
+      setCodeByQuestion((prev) => ({ ...prev, [current.questionId]: current.starterCode! }));
+    } else {
+      setCode("");
+    }
+  }, [codeByQuestion, current?.questionId, current?.useIDE, current?.starterCode, setCode]);
 
   const loadNextQuestion = async () => {
     if (!current?.id) return;
@@ -519,7 +537,9 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
   const activeCheckResult = current?.questionId
     ? checkResultsByQuestion[current.questionId] ?? null
     : testResult;
-  const activeRunResult = current?.questionId ? runResultsByQuestion[current.questionId] ?? null : runResult;
+  const activeRunResult = current?.questionId ? runResultsByQuestion[current.questionId] ?? runResult : runResult;
+  const activeCode = current?.questionId ? codeByQuestion[current.questionId] ?? code : code;
+  const isLocked = current?.questionId ? lockRunCheck[current.questionId] ?? false : false;
 
   if (!current) return <div>Загрузка сессии...</div>;
 
@@ -592,7 +612,8 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
           {!current.useIDE && (
             <Card title="Ответ на задание">
               <TextArea
-                className="select-text"
+                className="select-text min-h-[240px]"
+                rows={12}
                 value={answersState[current.questionId ?? ""] ?? answer}
                 onChange={(e) => {
                   if (current?.questionId) {
@@ -720,12 +741,12 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
           )}
           {current.useIDE && (
             <Card className="relative">
-              <div className="absolute right-3 top-3 z-10 flex items-center gap-2 rounded-md border border-[var(--border)] bg-white/90 px-2 py-1 text-sm dark:bg-black/50">
+              <div className="absolute right-0 top-0 z-10 flex items-center gap-1 rounded-bl border border-[var(--border)] border-t-0 border-r-0 bg-white/90 px-2 py-1 text-xs shadow-sm dark:bg-black/60">
                 <span className="text-[var(--muted)]">Язык:</span>
                 <select
                   value={selectedLanguage}
                   onChange={(e) => setSelectedLanguage(e.target.value)}
-                  className="rounded border border-[var(--border)] bg-white px-2 py-1 text-sm text-black focus:outline-none dark:bg-slate-800 dark:text-white"
+                  className="h-8 min-w-[88px] rounded border border-[var(--border)] bg-white px-2 py-1 text-xs text-black focus:outline-none dark:bg-slate-800 dark:text-white"
                 >
                   {languageOptions.map((lang) => (
                     <option key={lang} value={lang}>
@@ -771,6 +792,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                   disabled={
                     runMutation.isPending ||
                     !current?.codeTaskId ||
+                    isLocked ||
                     (current?.questionId && (attemptsByQuestion[current.questionId] ?? 0) >= 3)
                   }
                   className="flex-1 min-w-[140px] bg-[rgba(109,65,128,0.25)] text-[rgb(109,65,128)] border border-[rgba(109,65,128,0.55)] hover:bg-[rgba(109,65,128,0.35)] shadow-sm"
@@ -782,6 +804,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                   disabled={
                     mutation.isPending ||
                     !current?.codeTaskId ||
+                    isLocked ||
                     (current?.questionId && (attemptsByQuestion[current.questionId] ?? 0) >= 3)
                   }
                   size="lg"
@@ -811,7 +834,7 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
                           </div>
                           <div className="text-xs text-[var(--muted)]">
                             <div>Ожидалось: {JSON.stringify(t.expected)}</div>
-                            <div>Получено: {JSON.stringify(t.actual)}</div>
+                            <div>Получено: {JSON.stringify(t.actual ?? t.output ?? t.result)}</div>
                           </div>
                         </div>
                       ))}
@@ -824,23 +847,25 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
           {!current.useIDE && activeLastKind === "check" && activeCheckResult && <TestResults result={activeCheckResult} />}
         </div>
         {current.useIDE && (
-          <div
-            className="h-full cursor-col-resize self-stretch rounded-full bg-[var(--border)] transition hover:bg-vibe-400"
-            onMouseDown={() => {
-              isDragging.current = true;
-            }}
-          />
+          <>
+            <div
+              className="h-full cursor-col-resize self-stretch rounded-full bg-[var(--border)] transition hover:bg-vibe-400"
+              onMouseDown={() => {
+                isDragging.current = true;
+              }}
+            />
+            <div className="relative flex flex-1 min-w-[520px] w-full">
+              <ChatPane
+                sessionId={current.id}
+                questionId={current.questionId}
+                taskId={current.codeTaskId}
+                ownerId={user?.id}
+                language={selectedLanguage || current.language}
+                userCode={codeByQuestion[current.questionId ?? ""] ?? code}
+              />
+            </div>
+          </>
         )}
-        <div className="relative flex flex-1 min-w-[520px] w-full">
-          <ChatPane
-            sessionId={current.id}
-            questionId={current.questionId}
-            taskId={current.codeTaskId}
-            ownerId={user?.id}
-            language={selectedLanguage || current.language}
-            userCode={codeByQuestion[current.questionId ?? ""] ?? code}
-          />
-        </div>
       </div>
     </main>
     {finishConfirm && (
@@ -854,14 +879,14 @@ export default function InterviewSessionPage({ params }: { params: { id: string 
               <Button
                 variant={generateReport ? "default" : "outline"}
                 onClick={() => setGenerateReport(true)}
-                className={generateReport ? "" : "border-[var(--border)]"}
+                className={generateReport ? "ring-2 ring-vibe-500 ring-offset-1" : "border-[var(--border)]"}
               >
                 Да
               </Button>
               <Button
                 variant={!generateReport ? "default" : "outline"}
                 onClick={() => setGenerateReport(false)}
-                className={!generateReport ? "" : "border-[var(--border)]"}
+                className={!generateReport ? "ring-2 ring-vibe-500 ring-offset-1" : "border-[var(--border)]"}
               >
                 Нет
               </Button>

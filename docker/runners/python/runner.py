@@ -19,7 +19,7 @@ def main():
     code_path = workdir / "user_code.py"
     result = {"tests": [], "error": None}
     try:
-        data = json.loads(tests_path.read_text(encoding="utf-8"))
+        data = json.loads(tests_path.read_text(encoding="utf-8")) 
         fn_name = data.get("function_name")
         cases = data.get("tests", [])
         fn = load_function(code_path, fn_name)

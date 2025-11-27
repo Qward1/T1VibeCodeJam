@@ -67,11 +67,11 @@ export default function AdminPage() {
   const isSuper = user?.role === "superadmin";
   const directions = ["Frontend", "Backend", "DS", "ML", "DevOps", "Fullstack"];
   const difficulties: Level[] = ["Junior", "Middle", "Senior"];
-  const taskTypes = ["Coding", "Algorithms", "Debug", "Theory"];
+  const taskTypes = ["Coding", "Theory"];
   const [assignTarget, setAssignTarget] = useState<Candidate | null>(null);
   const [assignDirection, setAssignDirection] = useState<string>(directions[0]);
   const [assignLevel, setAssignLevel] = useState<Level>("Middle");
-  const [assignTasks, setAssignTasks] = useState<string[]>(["Coding"]);
+  const [assignTasks, setAssignTasks] = useState<string[]>(["Coding", "Theory"]);
   const [assignDuration, setAssignDuration] = useState<number>(45);
 
   const toggleAssignTask = (task: string) => {
@@ -101,6 +101,30 @@ export default function AdminPage() {
     mutationFn: (targetUserId: string) => api.revokeAdmin(targetUserId),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["admin"] }),
   });
+  const downloadReport = async (reportId: string | null | undefined) => {
+    if (!reportId) return;
+    try {
+      const data = await api.getReport(reportId);
+      const report: any = (data as any).report ?? data ?? {};
+      const summary =
+        report.candidate_answer_text ||
+        report.candidate_report_text ||
+        report.summary_candidate ||
+        report.summary ||
+        "Текст отчёта не найден";
+      const blob = new Blob([summary], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `report-${report.id || reportId}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.warn("download report failed", e);
+    }
+  };
 
   const filtered = useMemo(() => {
     if (!data) return [];
@@ -134,17 +158,16 @@ export default function AdminPage() {
           <Input placeholder="Поиск по имени или email" value={search} onChange={(e) => setSearch(e.target.value)} />
         </div>
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
+          <table className="w-full text-sm table-fixed">
             <thead className="text-left text-[var(--muted)]">
               <tr>
-                <th className="py-2">Имя</th>
-                <th>Email</th>
-                <th>Роль</th>
-                <th>Тема</th>
-                <th>Score</th>
-                <th></th>
-                <th></th>
-                {isSuper && <th></th>}
+                <th className="py-2 px-3 w-[18%]">Имя</th>
+                <th className="px-3 w-[20%]">Email</th>
+                <th className="px-3 w-[12%]">Роль</th>
+                <th className="px-3 w-[10%]">Score</th>
+                <th className="px-3 w-[18%]">Действие</th>
+                <th className="px-3 w-[18%]">Отчёт</th>
+                {isSuper && <th className="px-3 w-[14%]"></th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--border)]">
@@ -155,15 +178,16 @@ export default function AdminPage() {
                     c.hasFlags ? "bg-rose-50/70 dark:bg-rose-900/10" : ""
                   }`}
                 >
-                  <td className="py-2 font-semibold">{c.name}</td>
-                  <td className="text-[var(--muted)]">{c.email}</td>
-                  <td className="text-sm">{c.role ?? (c.admin ? "admin" : "user")}</td>
-                  <td>{c.lastTopic}</td>
-                  <td>
+                  <td className="py-2 px-3 font-semibold break-words">{c.name}</td>
+                  <td className="px-3 text-[var(--muted)] break-words">{c.email}</td>
+                  <td className="px-3 text-sm">{c.role ?? (c.admin ? "admin" : "user")}</td>
+                  <td className="px-3">
                     <Badge label={`${c.lastScore}`} tone={c.lastScore > 80 ? "success" : "info"} />
                   </td>
-                  <td className="whitespace-nowrap">
-                    {c.role !== "admin" && c.role !== "superadmin" && (
+                  <td className="px-3 whitespace-nowrap">
+                    {c.role === "superadmin" ? (
+                      <span className="text-xs text-[var(--muted)]">Недоступно</span>
+                    ) : (
                       <Button
                         size="sm"
                         variant="outline"
@@ -174,24 +198,40 @@ export default function AdminPage() {
                           setAssignTasks(["Coding"]);
                           setAssignDuration(45);
                         }}
+                        className="px-4 py-2"
                       >
                         Назначить собеседование
                       </Button>
                     )}
-                  </td>
-                  <td>
-                    <a
-                      href={`/report/${c.id}`}
-                      className="text-sm text-vibe-600 underline decoration-dotted underline-offset-4"
-                    >
-                      Отчёт
-                    </a>
+                 </td>
+                  <td className="px-3">
+                    {c.lastReportId ? (
+                      <div className="flex flex-col gap-1">
+                        <a
+                          href={`/report/${c.lastReportId}`}
+                          className="text-sm text-vibe-600 underline decoration-dotted underline-offset-4"
+                          title="Последний отчёт по собеседованию"
+                        >
+                          Отчёт
+                        </a>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => downloadReport(c.lastReportId)}
+                          className="text-xs"
+                        >
+                          Скачать отчёт
+                        </Button>
+                      </div>
+                    ) : (
+                      <span className="text-sm text-[var(--muted)]">Отчётов нет</span>
+                    )}
                     {c.hasFlags && (
                       <div className="text-xs text-rose-500">Анти-чит: {c.flagsCount ?? 0}</div>
                     )}
                   </td>
                   {isSuper && (
-                    <td className="space-x-2 whitespace-nowrap">
+                    <td className="px-3 space-x-2 whitespace-nowrap">
                       {c.id !== "super-1" && (
                         c.admin ? (
                           <Button
@@ -304,9 +344,9 @@ export default function AdminPage() {
         </Card>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Card title="Анти-чит события" className="lg:col-span-2">
-          <div className="mb-2 flex items-center justify-between">
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card title="Анти-чит события" className="lg:col-span-2 min-h-[420px]">
+          <div className="mb-3 flex items-center justify-between">
             <div className="text-sm text-[var(--muted)]">Последние триггеры</div>
             <button
               className="rounded-full border border-rose-300 px-3 py-1 text-xs font-semibold text-rose-600 transition hover:bg-rose-50"
@@ -343,29 +383,6 @@ export default function AdminPage() {
               </div>
             ))}
             {(events ?? []).length === 0 && <div className="text-[var(--muted)]">Событий пока нет</div>}
-          </div>
-        </Card>
-        <Card title="Глобальная аналитика">
-          <div className="space-y-3 text-sm">
-            <div className="flex items-center justify-between">
-              <span>Completion rate</span>
-              <Badge label={`${Math.round((data?.analytics.completionRate ?? 0) * 100)}%`} />
-            </div>
-            <div className="flex items-center justify-between">
-              <span>Avg score</span>
-              <Badge label={`${Math.round((data?.analytics.avgScore ?? 0) * 100)}/100`} tone="success" />
-            </div>
-            <div>
-              <div className="text-[var(--muted)]">Самые сложные темы</div>
-              <div className="mt-2 space-y-2">
-                {data?.analytics.hardestTopics.map((t) => (
-                  <div key={t.name} className="flex items-center justify_between rounded-xl bg-vibe-50 px-3 py-2 text-vibe-800 dark:bg-white/5 dark:text-white">
-                    <span>{t.name}</span>
-                    <span>{t.score}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
           </div>
         </Card>
       </div>
